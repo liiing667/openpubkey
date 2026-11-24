@@ -65,6 +65,13 @@ func PktToX509Template(pkt *pktoken.PKToken) (*x509.Certificate, error) {
 		return nil, err
 	}
 
+	// The PK Token must still be valid. A certificate must never be issued
+	// from an expired PK Token, otherwise the cert would outlive the
+	// identity assertion it is bound to.
+	if err := checkPktNotExpired(idtClaims); err != nil {
+		return nil, err
+	}
+
 	cic, err := pkt.GetCicValues()
 	if err != nil {
 		return nil, err
@@ -75,8 +82,15 @@ func PktToX509Template(pkt *pktoken.PKToken) (*x509.Certificate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error marshalling public key: %w", err)
 	}
+
+	// Each certificate gets a fresh random serial number so that reissuing
+	// a certificate never reuses a serial number.
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("error generating serial number: %w", err)
+	}
 	template := &x509.Certificate{
-		SerialNumber:            big.NewInt(1),
+		SerialNumber:            serialNumber,
 		Subject:                 pkix.Name{CommonName: idtClaims.Subject},
 		RawSubjectPublicKeyInfo: ecPub,
 		NotBefore:               time.Now(),
@@ -96,4 +110,16 @@ func PktToX509Template(pkt *pktoken.PKToken) (*x509.Certificate, error) {
 	}
 
 	return template, nil
+}
+
+// checkPktNotExpired ensures the ID Token in the PK Token has a valid
+// expiration (exp) claim that has not yet passed.
+func checkPktNotExpired(idtClaims *oidc.OidcClaims) error {
+	if idtClaims.Expiration <= 0 {
+		return fmt.Errorf("PK token is missing a valid expiration claim (exp = %v)", idtClaims.Expiration)
+	}
+	if time.Now().After(time.Unix(idtClaims.Expiration, 0)) {
+		return fmt.Errorf("PK token has expired (exp = %v)", idtClaims.Expiration)
+	}
+	return nil
 }

@@ -65,16 +65,21 @@ func (a *Ca) KeyGen(alg string) error {
 	if err != nil {
 		return fmt.Errorf("failed to parse key algorithm from %s: %w", alg, err)
 	}
-	a.Alg = keyAlg.String()
 
 	pksk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return err
 	}
-	a.pksk = pksk
+
+	// Use a fresh random serial number so regenerating the CA never
+	// reuses a serial number.
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return err
+	}
 
 	caTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(2019),
+		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			Organization:  []string{"Openpubkey-test-ca-cert"},
 			Country:       []string{"International"},
@@ -91,7 +96,7 @@ func (a *Ca) KeyGen(alg string) error {
 		BasicConstraintsValid: true,
 	}
 
-	caBytes, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &a.pksk.PublicKey, a.pksk)
+	caBytes, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &pksk.PublicKey, pksk)
 	if err != nil {
 		return err
 	}
@@ -103,6 +108,14 @@ func (a *Ca) KeyGen(alg string) error {
 	}); err != nil {
 		return err
 	}
+
+	// Commit the CA algorithm, key and root certificate together only after
+	// every step has succeeded. This keeps the CA key and its certificate
+	// chain consistent: a failure cannot leave a half-initialized CA where
+	// the key no longer matches the root cert, and retrying KeyGen after a
+	// failure starts again from the last consistent state.
+	a.Alg = keyAlg.String()
+	a.pksk = pksk
 	a.RootCertPem = caPEM.Bytes()
 
 	return nil
@@ -114,7 +127,9 @@ func (a *Ca) CheckPKToken(pktJson []byte) (*pktoken.PKToken, error) {
 		return nil, err
 	}
 
-	verifier, err := verifier.New(a.op)
+	// The CA issues certificates bound to the identity in the PK Token, so
+	// the token must be valid according to its own expiration (exp) claim.
+	verifier, err := verifier.New(a.op, verifier.WithExpirationPolicy(verifier.ExpirationPolicies.OIDC))
 	if err != nil {
 		return nil, err
 	}
@@ -168,8 +183,11 @@ func (a *Ca) PktToSignedX509(pktJson []byte) ([]byte, error) {
 	return pemSubCert.Bytes(), nil
 }
 
-// VerifyPktCert checks that the X509 cert is signed by the CA and that
-// the PK Token in the cert matches the public key in the cert.
+// VerifyPktCert checks that the X509 cert is signed by the CA, that
+// the PK Token in the cert matches the public key in the cert and that
+// the PK Token in the cert is still valid. Certs whose PK Token is still
+// valid verify exactly as before; certs carrying an expired or otherwise
+// invalid PK Token are rejected.
 func (a *Ca) VerifyPktCert(issuedCertPEM []byte) error {
 
 	roots := x509.NewCertPool()
@@ -200,6 +218,13 @@ func (a *Ca) VerifyPktCert(issuedCertPEM []byte) error {
 	if err := json.Unmarshal(pktJson, pkt); err != nil {
 		return err
 	}
+
+	// The PK Token bound to the certificate must still verify, including
+	// its expiration.
+	if _, err := a.CheckPKToken(pktJson); err != nil {
+		return fmt.Errorf("PK Token in certificate failed verification: %w", err)
+	}
+
 	pktUpk, err := ExtractRawPubkey(pkt)
 	if err != nil {
 		return err
