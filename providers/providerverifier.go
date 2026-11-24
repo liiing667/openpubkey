@@ -68,6 +68,24 @@ type ProviderVerifierOpts struct {
 	// AudClaimPrefix optionally requires the aud to be this prefix followed by
 	// the cicHash. Only valid with AUD_CLAIM. See RFC 8725 Section 3.12.
 	AudClaimPrefix string
+	// CIPolicy optionally restricts which repository, workflow and audience
+	// claims an ID Token may carry. The claim names are filled in from the
+	// issuer's CI provider (GitHub Actions, GitLab CI or Forgejo Actions) when
+	// not set explicitly.
+	CIPolicy any
+	// Policy optionally points at a CI policy to enforce. It is equivalent to
+	// CIPolicy and is provided for callers that prefer constructing a policy
+	// separately.
+	Policy any
+	// Repositories, Workflows and Audiences optionally allowlist CI claims
+	// directly, as a shorthand for CIPolicy.
+	Repositories []string
+	Workflows    []string
+	Audiences    []string
+	// Repository, Workflow and Audience are single-value shorthands.
+	Repository any
+	Workflow   any
+	Audience   any
 }
 
 // Creates a new ProviderVerifier with required fields
@@ -176,6 +194,22 @@ func (v *DefaultProviderVerifier) VerifyIDToken(ctx context.Context, idToken []b
 
 	if err := v.verifyCommitment(idt, cic); err != nil {
 		return err
+	}
+
+	policy := ciPolicyFromArgs(v.options.CIPolicy)
+	if v.options.Policy != nil {
+		policy = ciPolicyFromArgs(v.options.Policy)
+	}
+	policy = policy.merge(CIPolicy{
+		Repositories: v.options.Repositories,
+		Workflows:    v.options.Workflows,
+		Audiences:    v.options.Audiences,
+		Repository:   v.options.Repository,
+		Workflow:     v.options.Workflow,
+		Audience:     v.options.Audience,
+	})
+	if err := policy.withDefaultClaims(v.issuer).CheckClaims(idt.GetRaw()); err != nil {
+		return fmt.Errorf("ID Token rejected by CI policy: %w", err)
 	}
 
 	return nil

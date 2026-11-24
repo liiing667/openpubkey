@@ -28,29 +28,73 @@ import (
 
 const gitlabIssuer = "https://gitlab.com"
 
+// Claim names used by GitLab CI/CD OIDC ID Tokens. See
+// https://docs.gitlab.com/ee/ci/secrets/id_token_authentication.html#token-payload
+const (
+	gitlabRepositoryClaim = "project_path"
+	gitlabWorkflowClaim   = "ref"
+	gitlabRefPathClaim    = "ref_path"
+	gitlabAudienceClaim   = "aud"
+)
+
 type GitlabCiOp struct {
 	issuer                    string // Change issuer to point this to a test issuer
 	publicKeyFinder           discover.PublicKeyFinder
 	tokenEnvVar               string
 	requestTokensOverrideFunc func(string) (*simpleoidc.Tokens, error)
+	// policy optionally restricts which projects, refs and audiences may
+	// mint PK Tokens. When empty every well-formed token is accepted,
+	// preserving the previous behavior.
+	policy CIPolicy
 }
 
-func NewGitlabCiOpFromEnvironmentDefault() *GitlabCiOp {
-	return NewGitlabCiOpFromEnvironment("OPENPUBKEY_JWT")
+func NewGitlabCiOpFromEnvironmentDefault(policyArgs ...any) *GitlabCiOp {
+	return NewGitlabCiOpFromEnvironment("OPENPUBKEY_JWT", policyArgs...)
 }
 
-func NewGitlabCiOpFromEnvironment(tokenEnvVar string) *GitlabCiOp {
-	return NewGitlabCiOp(gitlabIssuer, tokenEnvVar)
+func NewGitlabCiOpFromEnvironment(tokenEnvVar string, policyArgs ...any) *GitlabCiOp {
+	return NewGitlabCiOp(gitlabIssuer, tokenEnvVar, policyArgs...)
 }
 
-func NewGitlabCiOp(issuer string, tokenEnvVar string) *GitlabCiOp {
+func NewGitlabCiOp(issuer string, tokenEnvVar string, policyArgs ...any) *GitlabCiOp {
 	op := &GitlabCiOp{
 		issuer:                    issuer,
 		publicKeyFinder:           *discover.DefaultPubkeyFinder(),
 		tokenEnvVar:               tokenEnvVar,
 		requestTokensOverrideFunc: nil,
 	}
+	op.setPolicy(ciPolicyFromArgs(policyArgs...))
 	return op
+}
+
+// NewGitlabCiOpWithPolicy creates a GitlabCiOp whose ID Tokens must satisfy
+// policy before a PK Token is generated or verified. The claim names used by
+// GitLab CI (project_path, ref and aud) are configured on the policy
+// automatically; callers only supply the allowed values.
+//
+// LegacyAudienceClaim, if set on policy, keeps accepting tokens that carry
+// the audience in an older, custom claim alongside the standard "aud" claim.
+func NewGitlabCiOpWithPolicy(issuer string, tokenEnvVar string, policy any) *GitlabCiOp {
+	op := NewGitlabCiOp(issuer, tokenEnvVar)
+	op.setPolicy(ciPolicyFromArgs(policy))
+	return op
+}
+
+// NewGitlabCiOpWithCIPolicy is an alias for NewGitlabCiOpWithPolicy.
+func NewGitlabCiOpWithCIPolicy(issuer string, tokenEnvVar string, policy CIPolicy) *GitlabCiOp {
+	return NewGitlabCiOpWithPolicy(issuer, tokenEnvVar, policy)
+}
+
+// NewGitlabCiOpFromEnvironmentWithPolicy creates a GitLab CI provider from the
+// named environment variable and enforces policy on its ID Tokens.
+func NewGitlabCiOpFromEnvironmentWithPolicy(tokenEnvVar string, policy CIPolicy) *GitlabCiOp {
+	return NewGitlabCiOpFromEnvironment(tokenEnvVar, policy)
+}
+
+// NewGitlabCiOpFromEnvironmentDefaultWithPolicy creates a GitLab CI provider
+// using the default OPENPUBKEY_JWT environment variable.
+func NewGitlabCiOpFromEnvironmentDefaultWithPolicy(policy CIPolicy) *GitlabCiOp {
+	return NewGitlabCiOpFromEnvironmentDefault(policy)
 }
 
 func (g *GitlabCiOp) PublicKeyByToken(ctx context.Context, token []byte) (*discover.PublicKeyRecord, error) {
@@ -89,6 +133,13 @@ func (g *GitlabCiOp) RequestTokens(ctx context.Context, cic *clientinstance.Clai
 	// a public value.
 	idTokenLB := memguard.NewBufferFromBytes(idToken)
 	defer idTokenLB.Destroy()
+	// Enforce the CI policy on the raw ID Token before the GQ bound
+	// signature is created. A policy failure aborts RequestTokens and no PK
+	// Token is produced, so a failed provider/policy switch cannot advance
+	// the trust state of the run.
+	if err := g.policy.CheckClaims(idTokenLB.Bytes()); err != nil {
+		return nil, fmt.Errorf("GitLab CI ID Token rejected by CI policy: %w", err)
+	}
 	gqToken, err := CreateGQBoundToken(ctx, idTokenLB.Bytes(), g, string(cicHash))
 	if err != nil {
 		return nil, err
@@ -101,8 +152,51 @@ func (g *GitlabCiOp) Issuer() string {
 }
 
 func (g *GitlabCiOp) VerifyIDToken(ctx context.Context, idt []byte, cic *clientinstance.Claims) error {
-	vp := NewProviderVerifier(g.issuer,
-		ProviderVerifierOpts{CommitType: CommitTypesEnum.GQ_BOUND, GQOnly: true, SkipClientIDCheck: true},
-	)
-	return vp.VerifyIDToken(ctx, idt, cic)
+	opts := ProviderVerifierOpts{CommitType: CommitTypesEnum.GQ_BOUND, GQOnly: true, SkipClientIDCheck: true}
+	if g.publicKeyFinder.JwksFunc != nil {
+		opts.DiscoverPublicKey = &g.publicKeyFinder
+	}
+	vp := NewProviderVerifier(g.issuer, opts)
+	if err := vp.VerifyIDToken(ctx, idt, cic); err != nil {
+		return err
+	}
+	// Re-check the CI policy at verification time so that a PK Token minted
+	// by a project, ref or audience outside the allowlist is rejected even
+	// when its GQ signature and commitment are valid.
+	if err := g.policy.CheckClaims(idt); err != nil {
+		return fmt.Errorf("GitLab CI PK Token rejected by CI policy: %w", err)
+	}
+	return nil
+}
+
+// Policy returns the CI policy configured on this GitLab CI provider.
+func (g *GitlabCiOp) Policy() CIPolicy {
+	return g.policy
+}
+
+// GetPolicy is an alias for Policy.
+func (g *GitlabCiOp) GetPolicy() CIPolicy {
+	return g.policy
+}
+
+// SetPolicy replaces the CI policy and fills in the GitLab CI claim names when
+// the caller did not set them explicitly.
+func (g *GitlabCiOp) SetPolicy(policy CIPolicy) {
+	g.setPolicy(policy)
+}
+
+func (g *GitlabCiOp) setPolicy(policy CIPolicy) {
+	if policy.RepositoryClaim == "" {
+		policy.RepositoryClaim = gitlabRepositoryClaim
+	}
+	if policy.WorkflowClaim == "" {
+		policy.WorkflowClaim = gitlabWorkflowClaim
+	}
+	if policy.LegacyWorkflowClaim == "" {
+		policy.LegacyWorkflowClaim = gitlabRefPathClaim
+	}
+	if policy.AudienceClaim == "" {
+		policy.AudienceClaim = gitlabAudienceClaim
+	}
+	g.policy = policy
 }

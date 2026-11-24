@@ -35,6 +35,15 @@ import (
 // URL followed by this suffix, e.g. https://codeberg.org/api/actions.
 const forgejoIssuerPathSuffix = "/api/actions"
 
+// Claim names used by Forgejo Actions OIDC ID Tokens. Forgejo mirrors the
+// GitHub Actions token claim layout.
+const (
+	forgejoRepositoryClaim  = "repository"
+	forgejoWorkflowClaim    = "workflow"
+	forgejoWorkflowRefClaim = "workflow_ref"
+	forgejoAudienceClaim    = "aud"
+)
+
 // ForgejoOp is an OpenIdProvider for Forgejo Actions (e.g. Codeberg). Forgejo
 // runners issue ID Tokens the same way GitHub Actions runners do, using the
 // ACTIONS_ID_TOKEN_REQUEST_URL and ACTIONS_ID_TOKEN_REQUEST_TOKEN environment
@@ -46,6 +55,10 @@ type ForgejoOp struct {
 	tokenRequestAuthToken     string
 	publicKeyFinder           discover.PublicKeyFinder
 	requestTokensOverrideFunc func(string) (*simpleoidc.Tokens, error)
+	// policy optionally restricts which repositories, workflows and
+	// audiences may mint PK Tokens. When empty every well-formed token is
+	// accepted, preserving the previous behavior.
+	policy CIPolicy
 }
 
 var _ OpenIdProvider = (*ForgejoOp)(nil)
@@ -55,20 +68,43 @@ var _ OpenIdProvider = (*ForgejoOp)(nil)
 // ACTIONS_ID_TOKEN_REQUEST_URL and ACTIONS_ID_TOKEN_REQUEST_TOKEN environment
 // variables; they may be empty when the provider is only used to verify ID
 // Tokens.
-func NewForgejoOp(issuer string, tokenURL string, token string) *ForgejoOp {
-	return &ForgejoOp{
+func NewForgejoOp(issuer string, tokenURL string, token string, policyArgs ...any) *ForgejoOp {
+	op := &ForgejoOp{
 		issuer:                strings.TrimSuffix(issuer, "/"),
 		rawTokenRequestURL:    tokenURL,
 		tokenRequestAuthToken: token,
 		publicKeyFinder:       *discover.DefaultPubkeyFinder(),
 	}
+	op.setPolicy(ciPolicyFromArgs(policyArgs...))
+	return op
+}
+
+// NewForgejoOpWithPolicy creates a ForgejoOp whose ID Tokens must satisfy
+// policy before a PK Token is generated or verified. The claim names used by
+// Forgejo Actions (repository, workflow and aud) are configured on the
+// policy automatically; callers only supply the allowed values.
+func NewForgejoOpWithPolicy(issuer string, tokenURL string, token string, policy any) *ForgejoOp {
+	op := NewForgejoOp(issuer, tokenURL, token)
+	op.setPolicy(ciPolicyFromArgs(policy))
+	return op
+}
+
+// NewForgejoOpWithCIPolicy is an alias for NewForgejoOpWithPolicy.
+func NewForgejoOpWithCIPolicy(issuer string, tokenURL string, token string, policy CIPolicy) *ForgejoOp {
+	return NewForgejoOpWithPolicy(issuer, tokenURL, token, policy)
+}
+
+// NewForgejoOpFromEnvironmentWithPolicy creates a Forgejo Actions provider
+// from the runner environment and enforces policy on its ID Tokens.
+func NewForgejoOpFromEnvironmentWithPolicy(policy CIPolicy) (*ForgejoOp, error) {
+	return NewForgejoOpFromEnvironment(policy)
 }
 
 // NewForgejoOpFromEnvironment creates a Forgejo Actions provider from the
 // environment variables injected by the Forgejo runner. The issuer is derived
 // from the token request URL, so this works on any Forgejo instance without
 // additional configuration.
-func NewForgejoOpFromEnvironment() (*ForgejoOp, error) {
+func NewForgejoOpFromEnvironment(policyArgs ...any) (*ForgejoOp, error) {
 	tokenURL, err := getEnvVar("ACTIONS_ID_TOKEN_REQUEST_URL")
 	if err != nil {
 		return nil, err
@@ -81,7 +117,7 @@ func NewForgejoOpFromEnvironment() (*ForgejoOp, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewForgejoOp(issuer, tokenURL, token), nil
+	return NewForgejoOp(issuer, tokenURL, token, policyArgs...), nil
 }
 
 // IsForgejoIssuer reports whether issuer looks like a Forgejo Actions issuer,
@@ -138,6 +174,14 @@ func (o *ForgejoOp) RequestTokens(ctx context.Context, cic *clientinstance.Claim
 	}
 	defer idTokenLB.Destroy()
 
+	// Enforce the CI policy on the raw ID Token before the GQ signature is
+	// created. If the policy fails we return an error and never produce a
+	// PK Token, so a failed provider/policy switch cannot advance the trust
+	// state of the run.
+	if err := o.policy.CheckClaims(idTokenLB.Bytes()); err != nil {
+		return nil, fmt.Errorf("Forgejo Actions ID Token rejected by CI policy: %w", err)
+	}
+
 	gqToken, err := CreateGQToken(ctx, idTokenLB.Bytes(), o)
 	if err != nil {
 		return nil, err
@@ -152,7 +196,48 @@ func (o *ForgejoOp) VerifyIDToken(ctx context.Context, idt []byte, cic *clientin
 		GQOnly:            true,
 		SkipClientIDCheck: true,
 	})
-	return vp.VerifyIDToken(ctx, idt, cic)
+	if err := vp.VerifyIDToken(ctx, idt, cic); err != nil {
+		return err
+	}
+	// Re-check the CI policy at verification time so that a PK Token minted
+	// by a repository, workflow or audience outside the allowlist is
+	// rejected even when its GQ signature and commitment are valid.
+	if err := o.policy.CheckClaims(idt); err != nil {
+		return fmt.Errorf("Forgejo Actions PK Token rejected by CI policy: %w", err)
+	}
+	return nil
+}
+
+// Policy returns the CI policy configured on this Forgejo Actions provider.
+func (o *ForgejoOp) Policy() CIPolicy {
+	return o.policy
+}
+
+// GetPolicy is an alias for Policy.
+func (o *ForgejoOp) GetPolicy() CIPolicy {
+	return o.policy
+}
+
+// SetPolicy replaces the CI policy and fills in the Forgejo Actions claim names
+// when the caller did not set them explicitly.
+func (o *ForgejoOp) SetPolicy(policy CIPolicy) {
+	o.setPolicy(policy)
+}
+
+func (o *ForgejoOp) setPolicy(policy CIPolicy) {
+	if policy.RepositoryClaim == "" {
+		policy.RepositoryClaim = forgejoRepositoryClaim
+	}
+	if policy.WorkflowClaim == "" {
+		policy.WorkflowClaim = forgejoWorkflowClaim
+	}
+	if policy.LegacyWorkflowClaim == "" {
+		policy.LegacyWorkflowClaim = forgejoWorkflowRefClaim
+	}
+	if policy.AudienceClaim == "" {
+		policy.AudienceClaim = forgejoAudienceClaim
+	}
+	o.policy = policy
 }
 
 func (o *ForgejoOp) requestTokens(ctx context.Context, cicHash string) (*memguard.LockedBuffer, error) {

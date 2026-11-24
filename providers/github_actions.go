@@ -31,17 +31,30 @@ import (
 
 const githubIssuer = "https://token.actions.githubusercontent.com"
 
+// Claim names used by GitHub Actions OIDC ID Tokens. See
+// https://docs.github.com/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect
+const (
+	githubRepositoryClaim  = "repository"
+	githubWorkflowClaim    = "workflow"
+	githubWorkflowRefClaim = "workflow_ref"
+	githubAudienceClaim    = "aud"
+)
+
 type GithubOp struct {
 	issuer                    string // Change issuer to point this to a test issuer
 	rawTokenRequestURL        string
 	tokenRequestAuthToken     string
 	publicKeyFinder           discover.PublicKeyFinder
 	requestTokensOverrideFunc func(string) (*simpleoidc.Tokens, error)
+	// policy optionally restricts which repositories, workflows and
+	// audiences may mint PK Tokens. When empty every well-formed token is
+	// accepted, preserving the previous behavior.
+	policy CIPolicy
 }
 
 var _ OpenIdProvider = (*GithubOp)(nil)
 
-func NewGithubOpFromEnvironment() (*GithubOp, error) {
+func NewGithubOpFromEnvironment(policyArgs ...any) (*GithubOp, error) {
 	tokenURL, err := getEnvVar("ACTIONS_ID_TOKEN_REQUEST_URL")
 	if err != nil {
 		return nil, err
@@ -51,10 +64,10 @@ func NewGithubOpFromEnvironment() (*GithubOp, error) {
 		return nil, err
 	}
 
-	return NewGithubOp(tokenURL, token), nil
+	return NewGithubOp(tokenURL, token, policyArgs...), nil
 }
 
-func NewGithubOp(tokenURL string, token string) *GithubOp {
+func NewGithubOp(tokenURL string, token string, policyArgs ...any) *GithubOp {
 	op := &GithubOp{
 		issuer:                    githubIssuer,
 		rawTokenRequestURL:        tokenURL,
@@ -62,7 +75,29 @@ func NewGithubOp(tokenURL string, token string) *GithubOp {
 		publicKeyFinder:           *discover.DefaultPubkeyFinder(),
 		requestTokensOverrideFunc: nil,
 	}
+	op.setPolicy(ciPolicyFromArgs(policyArgs...))
 	return op
+}
+
+// NewGithubOpWithPolicy creates a GithubOp whose ID Tokens must satisfy
+// policy before a PK Token is generated or verified. The claim names used by
+// GitHub Actions (repository, workflow and aud) are configured on the policy
+// automatically; callers only supply the allowed values.
+func NewGithubOpWithPolicy(tokenURL string, token string, policy any) *GithubOp {
+	op := NewGithubOp(tokenURL, token)
+	op.setPolicy(ciPolicyFromArgs(policy))
+	return op
+}
+
+// NewGithubOpWithCIPolicy is an alias for NewGithubOpWithPolicy.
+func NewGithubOpWithCIPolicy(tokenURL string, token string, policy CIPolicy) *GithubOp {
+	return NewGithubOpWithPolicy(tokenURL, token, policy)
+}
+
+// NewGithubOpFromEnvironmentWithPolicy creates a GitHub Actions provider from
+// the runner environment and enforces policy on its ID Tokens.
+func NewGithubOpFromEnvironmentWithPolicy(policy CIPolicy) (*GithubOp, error) {
+	return NewGithubOpFromEnvironment(policy)
 }
 
 func buildTokenURL(rawTokenURL, audience string) (string, error) {
@@ -157,6 +192,13 @@ func (g *GithubOp) RequestTokens(ctx context.Context, cic *clientinstance.Claims
 		return nil, fmt.Errorf("error requesting ID Token: %w", err)
 	}
 	defer idTokenLB.Destroy()
+	// Enforce the CI policy on the raw ID Token before the GQ signature is
+	// created. If the policy fails we return an error and never produce a
+	// PK Token, so a failed provider/policy switch cannot advance the trust
+	// state of the run.
+	if err := g.policy.CheckClaims(idTokenLB.Bytes()); err != nil {
+		return nil, fmt.Errorf("GitHub Actions ID Token rejected by CI policy: %w", err)
+	}
 	gqToken, err := CreateGQToken(ctx, idTokenLB.Bytes(), g)
 
 	return &simpleoidc.Tokens{IDToken: gqToken}, err
@@ -167,6 +209,51 @@ func (g *GithubOp) Issuer() string {
 }
 
 func (g *GithubOp) VerifyIDToken(ctx context.Context, idt []byte, cic *clientinstance.Claims) error {
-	vp := NewProviderVerifier(g.issuer, ProviderVerifierOpts{CommitType: CommitTypesEnum.AUD_CLAIM, GQOnly: true, SkipClientIDCheck: true})
-	return vp.VerifyIDToken(ctx, idt, cic)
+	opts := ProviderVerifierOpts{CommitType: CommitTypesEnum.AUD_CLAIM, GQOnly: true, SkipClientIDCheck: true}
+	if g.publicKeyFinder.JwksFunc != nil {
+		opts.DiscoverPublicKey = &g.publicKeyFinder
+	}
+	vp := NewProviderVerifier(g.issuer, opts)
+	if err := vp.VerifyIDToken(ctx, idt, cic); err != nil {
+		return err
+	}
+	// Re-check the CI policy at verification time so that a PK Token minted
+	// by a repository, workflow or audience outside the allowlist is
+	// rejected even when its signature and commitment are valid.
+	if err := g.policy.CheckClaims(idt); err != nil {
+		return fmt.Errorf("GitHub Actions PK Token rejected by CI policy: %w", err)
+	}
+	return nil
+}
+
+// Policy returns the CI policy configured on this GitHub Actions provider.
+func (g *GithubOp) Policy() CIPolicy {
+	return g.policy
+}
+
+// GetPolicy is an alias for Policy.
+func (g *GithubOp) GetPolicy() CIPolicy {
+	return g.policy
+}
+
+// SetPolicy replaces the CI policy and fills in the GitHub Actions claim names
+// when the caller did not set them explicitly.
+func (g *GithubOp) SetPolicy(policy CIPolicy) {
+	g.setPolicy(policy)
+}
+
+func (g *GithubOp) setPolicy(policy CIPolicy) {
+	if policy.RepositoryClaim == "" {
+		policy.RepositoryClaim = githubRepositoryClaim
+	}
+	if policy.WorkflowClaim == "" {
+		policy.WorkflowClaim = githubWorkflowClaim
+	}
+	if policy.LegacyWorkflowClaim == "" {
+		policy.LegacyWorkflowClaim = githubWorkflowRefClaim
+	}
+	if policy.AudienceClaim == "" {
+		policy.AudienceClaim = githubAudienceClaim
+	}
+	g.policy = policy
 }
