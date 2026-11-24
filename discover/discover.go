@@ -23,6 +23,7 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +46,8 @@ type PublicKeyRecord struct {
 	PublicKey crypto.PublicKey
 	Alg       string
 	Issuer    string
+	// WasCached reports which complete JWKS generation supplied PublicKey:
+	// true for the cached generation, false for a freshly fetched one.
 	WasCached bool
 }
 
@@ -191,10 +194,31 @@ func parseJwks(b []byte) (jwk.Set, error) {
 	return jwk.Parse(b, jwk.WithStrictKeySetParsing(false))
 }
 
+// jwksGeneration is one complete JWKS document, either read from the cache or
+// fetched from the provider. Keys are only ever looked up within a single
+// generation, never by combining entries from different fetches. generationID
+// identifies the exact document, so a caller can tell which key set a record
+// was resolved against even when several lookups race with a key rotation.
+type jwksGeneration struct {
+	keys jwk.Set
+	// wasCached is true when this generation was read from the discovery cache.
+	// It is the generation reported by PublicKeyRecord.WasCached.
+	wasCached bool
+	// freshAttempted is true when a provider fetch was already tried for this
+	// lookup and failed, leaving only a fallback cache generation. In that case
+	// another lookup-triggered refresh would just hit the same failure.
+	freshAttempted bool
+	id             string
+}
+
+func generationID(jwksJSON []byte) string {
+	return fmt.Sprintf("%x", sha256.Sum256(jwksJSON))
+}
+
 // readCache returns the cached JWKS for issuer if it is no older than maxAge.
 // A cache miss, a read error or a parse error returns nil. It never fetches a
 // fresh JWKS.
-func (f *PublicKeyFinder) readCache(ctx context.Context, issuer string, maxAge time.Duration) jwk.Set {
+func (f *PublicKeyFinder) readCache(ctx context.Context, issuer string, maxAge time.Duration) *jwksGeneration {
 	if f.CacheConfig.Cache == nil {
 		return nil
 	}
@@ -207,11 +231,11 @@ func (f *PublicKeyFinder) readCache(ctx context.Context, issuer string, maxAge t
 		_, _ = fmt.Fprintf(f.ErrWriter(), "Failed to unmarshal cached JWKS for %s: %v\n", issuer, err)
 		return nil
 	}
-	return jwks
+	return &jwksGeneration{keys: jwks, wasCached: true, id: generationID(b)}
 }
 
 // fetchFresh retrieves the JWKS from the provider and, on success, caches it.
-func (f *PublicKeyFinder) fetchFresh(ctx context.Context, issuer string) (jwk.Set, error) {
+func (f *PublicKeyFinder) fetchFresh(ctx context.Context, issuer string) (*jwksGeneration, error) {
 	jwksJson, err := f.JwksFunc(ctx, issuer)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch fresh JWKS: %w", err)
@@ -225,31 +249,32 @@ func (f *PublicKeyFinder) fetchFresh(ctx context.Context, issuer string) (jwk.Se
 			_, _ = fmt.Fprintf(f.ErrWriter(), "Failed to write JWKS cache for %s: %v\n", issuer, err)
 		}
 	}
-	return jwks, nil
+	return &jwksGeneration{keys: jwks, id: generationID(jwksJson)}, nil
 }
 
-func (f *PublicKeyFinder) fetchAndParseJwks(ctx context.Context, issuer string, mayUseCache bool) (jwk.Set, bool, error) {
+func (f *PublicKeyFinder) fetchAndParseJwks(ctx context.Context, issuer string, mayUseCache bool) (*jwksGeneration, error) {
 	if mayUseCache {
-		if jwks := f.readCache(ctx, issuer, f.CacheConfig.StandardMaxAge); jwks != nil {
-			return jwks, true, nil
+		if gen := f.readCache(ctx, issuer, f.CacheConfig.StandardMaxAge); gen != nil {
+			return gen, nil
 		}
 	}
 
-	jwks, err := f.fetchFresh(ctx, issuer)
+	gen, err := f.fetchFresh(ctx, issuer)
 	if err == nil {
-		return jwks, false, nil
+		return gen, nil
 	}
 
 	// Provider unreachable or serving garbage: fall back to a cached entry that
 	// is too old for normal use but still within FallbackMaxAge, unless the
 	// caller explicitly asked to bypass the cache.
 	if mayUseCache {
-		if fallbackJwks := f.readCache(ctx, issuer, f.CacheConfig.FallbackMaxAge); fallbackJwks != nil {
-			_, _ = fmt.Fprintf(f.ErrWriter(), "Using fallback JWKS from cache for %s: %v\n", issuer, err)
-			return fallbackJwks, true, nil
+		if fallbackGen := f.readCache(ctx, issuer, f.CacheConfig.FallbackMaxAge); fallbackGen != nil {
+			_, _ = fmt.Fprintf(f.ErrWriter(), "Using fallback JWKS from cache for %s (generation %s): %v\n", issuer, fallbackGen.id, err)
+			fallbackGen.freshAttempted = true
+			return fallbackGen, nil
 		}
 	}
-	return nil, false, err
+	return nil, err
 }
 
 // ByToken looks up the OP public key for the supplied token. It keeps only the
@@ -310,7 +335,9 @@ func (f *PublicKeyFinder) ByToken(ctx context.Context, issuer string, token []by
 //
 // As recommended by RFC 7517 section 5, entries that cannot be used are
 // skipped. Skipped entries with the kid, and kids shared by several keys, are
-// reported on ErrWriter.
+// reported on ErrWriter. If several usable keys in the same generation share
+// the kid (and, when an alg is requested, are published for that alg), the
+// lookup is ambiguous and fails rather than choosing one arbitrarily.
 func (f *PublicKeyFinder) ByKeyID(ctx context.Context, issuer string, keyID string, mayUseCache bool) (*PublicKeyRecord, error) {
 	return f.byAlgAndKeyID(ctx, issuer, "", keyID, mayUseCache)
 }
@@ -325,13 +352,35 @@ type jwksEntry struct {
 // byAlgAndKeyID returns the key published for alg with the given kid. An
 // empty alg matches every key.
 func (f *PublicKeyFinder) byAlgAndKeyID(ctx context.Context, issuer string, alg string, keyID string, mayUseCache bool) (*PublicKeyRecord, error) {
-	jwks, wasCached, err := f.fetchAndParseJwks(ctx, issuer, mayUseCache)
-	emptyPkr := &PublicKeyRecord{WasCached: wasCached}
+	gen, err := f.fetchAndParseJwks(ctx, issuer, mayUseCache)
 	if err != nil {
-		return emptyPkr, fmt.Errorf(`failed to fetch JWK set: %w`, err)
+		return &PublicKeyRecord{WasCached: false}, fmt.Errorf(`failed to fetch JWK set: %w`, err)
 	}
 
-	entries := decodeEntries(jwks, issuer, wasCached)
+	pkr, err := f.resolveGeneration(gen, issuer, alg, keyID)
+	if err == nil {
+		return pkr, nil
+	}
+
+	// A cached generation can be complete yet stale. If it cannot resolve this
+	// lookup, try the provider once. The lookup is then repeated against the
+	// fresh generation as a whole; entries from the two generations are never
+	// combined. If the refresh fails, report the generation that was actually
+	// used and the refresh failure rather than mixing old and new keys.
+	if mayUseCache && gen.wasCached && !gen.freshAttempted {
+		freshGen, freshErr := f.fetchFresh(ctx, issuer)
+		if freshErr == nil {
+			return f.resolveGeneration(freshGen, issuer, alg, keyID)
+		}
+		return pkr, errors.Join(err, fmt.Errorf("failed to refresh JWKS: %w", freshErr))
+	}
+	return pkr, err
+}
+
+// resolveGeneration looks up one key within a single JWKS generation.
+func (f *PublicKeyFinder) resolveGeneration(gen *jwksGeneration, issuer string, alg string, keyID string) (*PublicKeyRecord, error) {
+	emptyPkr := &PublicKeyRecord{WasCached: gen.wasCached}
+	entries := decodeEntries(gen.keys, issuer, gen.wasCached)
 	matches := usableForAlg(entries, alg)
 	kidEntries := entries
 	lookup := "token has no kid"
@@ -346,11 +395,42 @@ func (f *PublicKeyFinder) byAlgAndKeyID(ctx context.Context, issuer string, alg 
 		return emptyPkr, noKeyError(kidEntries, alg, keyID)
 	case len(matches) == 0 || (keyID == "" && len(matches) > 1):
 		return emptyPkr, fmt.Errorf("no matching public key found for kid %s", keyID)
+	case len(matches) > 1 && keyID != "":
+		if alg != "" {
+			return emptyPkr, ambiguousKeyError(gen, keyID, alg, len(matches))
+		}
+		if dupAlg, n, ok := duplicateAlg(matches); ok {
+			return emptyPkr, ambiguousKeyError(gen, keyID, dupAlg, n)
+		}
+		// Without a requested alg the keys are distinct alternatives (for
+		// example the same kid published for RS256, ES256 and Ed25519), so a
+		// caller that has not narrowed the search can still take the first.
+		_, _ = fmt.Fprintf(f.ErrWriter(), "Warning: JWK set for %s has %d keys with kid %q\n", issuer, len(matches), keyID)
 	case len(matches) > 1:
 		_, _ = fmt.Fprintf(f.ErrWriter(), "Warning: JWK set for %s has %d keys with kid %q\n", issuer, len(matches), keyID)
 	}
 	f.warnSkipped(issuer, unusable(kidEntries), lookup)
 	return matches[0].record, nil
+}
+
+// ambiguousKeyError reports a lookup that cannot be resolved to exactly one
+// key without crossing generation boundaries.
+func ambiguousKeyError(gen *jwksGeneration, keyID string, alg string, n int) error {
+	return fmt.Errorf("ambiguous public key lookup for kid %q in JWK set generation %s: multiple keys (%d usable) match alg %s; no unique key can be chosen",
+		keyID, gen.id, n, alg)
+}
+
+// duplicateAlg returns an algorithm that is published more than once among
+// entries, along with the number of keys published for it.
+func duplicateAlg(entries []jwksEntry) (string, int, bool) {
+	counts := make(map[string]int, len(entries))
+	for _, e := range entries {
+		counts[e.record.Alg]++
+		if counts[e.record.Alg] > 1 {
+			return e.record.Alg, counts[e.record.Alg], true
+		}
+	}
+	return "", 0, false
 }
 
 // noKeyError explains why no entry in a JWKS can be used to verify a token
@@ -438,14 +518,33 @@ func unusable(entries []jwksEntry) []jwksEntry {
 }
 
 func (f *PublicKeyFinder) ByJKT(ctx context.Context, issuer string, jkt string, mayUseCache bool) (*PublicKeyRecord, error) {
-	jwks, wasCached, err := f.fetchAndParseJwks(ctx, issuer, mayUseCache)
-	emptyPkr := &PublicKeyRecord{WasCached: wasCached}
+	gen, err := f.fetchAndParseJwks(ctx, issuer, mayUseCache)
 	if err != nil {
-		return emptyPkr, err
+		return &PublicKeyRecord{WasCached: false}, err
 	}
 
-	for i := range jwks.Len() {
-		key, ok := jwks.Key(i)
+	pkr, err := f.byJKTInGeneration(gen, issuer, jkt)
+	if err == nil {
+		return pkr, nil
+	}
+
+	// As with byAlgAndKeyID, a cached generation that does not contain the
+	// requested key may simply predate a rotation. Retry against one complete
+	// fresh generation; never merge the cached and fresh key sets.
+	if mayUseCache && gen.wasCached && !gen.freshAttempted {
+		freshGen, freshErr := f.fetchFresh(ctx, issuer)
+		if freshErr == nil {
+			return f.byJKTInGeneration(freshGen, issuer, jkt)
+		}
+		return pkr, errors.Join(err, fmt.Errorf("failed to refresh JWKS: %w", freshErr))
+	}
+	return pkr, err
+}
+
+func (f *PublicKeyFinder) byJKTInGeneration(gen *jwksGeneration, issuer string, jkt string) (*PublicKeyRecord, error) {
+	emptyPkr := &PublicKeyRecord{WasCached: gen.wasCached}
+	for i := range gen.keys.Len() {
+		key, ok := gen.keys.Key(i)
 		if !ok {
 			continue
 		}
@@ -462,7 +561,7 @@ func (f *PublicKeyFinder) ByJKT(ctx context.Context, issuer string, jkt string, 
 		}
 		jktOfKeyB64 := util.Base64EncodeForJWT(jktOfKey)
 		if jkt == string(jktOfKeyB64) {
-			pk, err := publicKeyRecordFromJWK(key, issuer, wasCached)
+			pk, err := publicKeyRecordFromJWK(key, issuer, gen.wasCached)
 			return pk, err
 		}
 	}
