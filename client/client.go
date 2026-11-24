@@ -21,10 +21,12 @@ import (
 	"crypto"
 	"fmt"
 	"net/http"
+	"sync"
 
 	"github.com/lestrrat-go/jwx/v3/jwk"
 
 	"github.com/openpubkey/openpubkey/jose"
+	simpleoidc "github.com/openpubkey/openpubkey/oidc"
 	"github.com/openpubkey/openpubkey/pktoken"
 	"github.com/openpubkey/openpubkey/pktoken/clientinstance"
 	"github.com/openpubkey/openpubkey/providers"
@@ -49,6 +51,12 @@ type OpkClient struct {
 	refreshToken []byte
 	accessToken  []byte
 	printPKToken bool // printPKToken is default false, used to debug PK Token contents
+	// authMu guards authGeneration and the identity fields above. Each Auth
+	// call runs in its own login generation; only the latest generation may
+	// commit its identity, so a stale or duplicate login cannot overwrite the
+	// client's current PK Token.
+	authMu         sync.Mutex
+	authGeneration uint64
 }
 
 // ClientOpts contains options for constructing an OpkClient
@@ -150,14 +158,19 @@ func (o *OpkClient) Auth(ctx context.Context, opts ...AuthOpts) (*pktoken.PKToke
 		applyOpt(authOpts)
 	}
 
+	// Start a new login generation. If another Auth is already in flight
+	// (e.g. the user navigated to the login twice), only the latest
+	// generation may commit its identity; a stale completion is discarded
+	// instead of overwriting the client's current PK Token.
+	generation := o.beginAuth()
+
 	// If no Cosigner is set then do standard OIDC authentication
 	if o.cosP == nil {
-		pkt, err := o.oidcAuth(ctx, o.signer, o.alg, authOpts.extraClaims)
+		pkt, tokens, err := o.oidcAuth(ctx, o.signer, o.alg, authOpts.extraClaims)
 		if err != nil {
 			return nil, err
 		}
-		o.pkToken = pkt
-		return o.pkToken.DeepCopy()
+		return o.commitAuth(generation, pkt, tokens)
 	}
 
 	// If a Cosigner is set then check that will support doing Cosigner auth
@@ -171,7 +184,7 @@ func (o *OpkClient) Auth(ctx context.Context, opts ...AuthOpts) (*pktoken.PKToke
 			http.Redirect(w, r, redirectUri, http.StatusFound)
 		})
 
-		pkt, err := o.oidcAuth(ctx, o.signer, o.alg, authOpts.extraClaims)
+		pkt, tokens, err := o.oidcAuth(ctx, o.signer, o.alg, authOpts.extraClaims)
 		if err != nil {
 			return nil, err
 		}
@@ -179,9 +192,37 @@ func (o *OpkClient) Auth(ctx context.Context, opts ...AuthOpts) (*pktoken.PKToke
 		if err != nil {
 			return nil, err
 		}
-		o.pkToken = pktCos
-		return o.pkToken.DeepCopy()
+		return o.commitAuth(generation, pktCos, tokens)
 	}
+}
+
+// beginAuth starts a new login generation and returns it. Starting a new
+// generation invalidates every earlier in-flight Auth: when the stale
+// attempt finishes, commitAuth refuses to let it overwrite the identity of
+// the newer login.
+func (o *OpkClient) beginAuth() uint64 {
+	o.authMu.Lock()
+	defer o.authMu.Unlock()
+	o.authGeneration++
+	return o.authGeneration
+}
+
+// commitAuth records the outcome of a login attempt as the client's current
+// identity, but only if the attempt still belongs to the latest login
+// generation. This prevents a duplicate or stale browser navigation from
+// overwriting the identity established by the most recent Auth call.
+func (o *OpkClient) commitAuth(generation uint64, pkt *pktoken.PKToken, tokens *simpleoidc.Tokens) (*pktoken.PKToken, error) {
+	o.authMu.Lock()
+	defer o.authMu.Unlock()
+	if generation != o.authGeneration {
+		return nil, fmt.Errorf("discarding PK Token from a stale login attempt: a newer Auth call has superseded it")
+	}
+	o.pkToken = pkt
+	if tokens != nil {
+		o.refreshToken = tokens.RefreshToken
+		o.accessToken = tokens.AccessToken
+	}
+	return o.pkToken.DeepCopy()
 }
 
 // oidcAuth performs the OpenIdConnect part of the protocol.
@@ -191,70 +232,68 @@ func (o *OpkClient) oidcAuth(
 	signer crypto.Signer,
 	alg jose.KeyAlgorithm,
 	extraClaims map[string]any,
-) (*pktoken.PKToken, error) {
+) (*pktoken.PKToken, *simpleoidc.Tokens, error) {
 	// keep track of any additional verifierChecks for the verifier
 	verifierChecks := []verifier.Check{}
 
 	// Use our signing key to generate a JWK key and set the "alg" header
 	jwkKey, err := jwk.PublicKeyOf(signer.Public())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	err = jwkKey.Set(jwk.AlgorithmKey, alg)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Use provided public key to generate client instance claims
 	cic, err := clientinstance.NewClaims(jwkKey, extraClaims)
 	if err != nil {
-		return nil, fmt.Errorf("failed to instantiate client instance claims: %w", err)
+		return nil, nil, fmt.Errorf("failed to instantiate client instance claims: %w", err)
 	}
 
 	// Check if the OP supports OpenID key binding and if it does pass the signer so it can perform DPoP
 	if keyBindingOp, ok := o.Op.(providers.KeyBindingOpenIdProvider); ok {
 		if err := keyBindingOp.ConfigKeyBinding(o.signer, o.alg); err != nil {
-			return nil, fmt.Errorf("error configuring OP to perform key binding: %w", err)
+			return nil, nil, fmt.Errorf("error configuring OP to perform key binding: %w", err)
 		}
 	}
 
 	tokens, err := o.Op.RequestTokens(ctx, cic)
 	if err != nil {
-		return nil, fmt.Errorf("error requesting OIDC tokens from OpenID Provider: %w", err)
+		return nil, nil, fmt.Errorf("error requesting OIDC tokens from OpenID Provider: %w", err)
 	}
 	idToken := tokens.IDToken
-	o.refreshToken = tokens.RefreshToken
-	o.accessToken = tokens.AccessToken
 
 	// Sign over the payload from the ID token and client instance claims
 	cicToken, err := cic.Sign(signer, alg, idToken)
 	if err != nil {
-		return nil, fmt.Errorf("error creating cic token: %w", err)
+		return nil, nil, fmt.Errorf("error creating cic token: %w", err)
 	}
 
 	// Combine our ID token and signature over the cic to create our PK Token
 	pkt, err := pktoken.New(idToken, cicToken)
 	if err != nil {
-		return nil, fmt.Errorf("error creating PK Token: %w", err)
+		return nil, nil, fmt.Errorf("error creating PK Token: %w", err)
 	}
 
 	// Print PK Token. This is off by default only useful for debugging issues with providers
 	if o.printPKToken {
 		if pktJson, err := pkt.MarshalJSON(); err != nil {
-			return nil, fmt.Errorf("error marshalling PK Token to JSON: %w", err)
+			return nil, nil, fmt.Errorf("error marshalling PK Token to JSON: %w", err)
 		} else {
 			fmt.Println("pkt:", string(pktJson))
 		}
 	}
 	pktVerifier, err := verifier.New(o.Op)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if err := pktVerifier.VerifyPKToken(ctx, pkt, verifierChecks...); err != nil {
-		return nil, fmt.Errorf("error verifying PK Token: %w", err)
+		return nil, nil, fmt.Errorf("error verifying PK Token: %w", err)
 	}
-	return pkt, nil
+	return pkt, tokens, nil
 }
 
 // Refresh uses a Refresh Token to request a fresh ID Token and Access Token from an OpenID Provider.

@@ -28,6 +28,8 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/openpubkey/openpubkey/providers"
 	"github.com/openpubkey/openpubkey/util"
@@ -57,6 +59,11 @@ type WebChooser struct {
 	mockServer    *httptest.Server
 	server        *http.Server
 	loginURIHook  LoginURIHook
+	// chooseMu guards chooseGeneration. Each ChooseOp call runs in its own
+	// generation so that a selection left over from a cancelled or superseded
+	// chooser session can be recognized and rejected.
+	chooseMu         sync.Mutex
+	chooseGeneration uint64
 	// browserOpener replaces util.OpenUrl in tests that exercise browser-open
 	// success and failure paths.
 	browserOpener func(string) error
@@ -87,10 +94,47 @@ func NewWebChooser(opList []providers.BrowserOpenIdProvider, openBrowser bool) *
 	}
 }
 
+// beginChoose starts a new chooser generation and returns it. Starting a new
+// generation invalidates every earlier chooser session: a /select request
+// belonging to an older generation (e.g. a browser tab left over from a
+// cancelled ChooseOp) is rejected instead of delivering a stale provider
+// choice.
+func (wc *WebChooser) beginChoose() uint64 {
+	wc.chooseMu.Lock()
+	defer wc.chooseMu.Unlock()
+	wc.chooseGeneration++
+	return wc.chooseGeneration
+}
+
+// chooseActive reports whether generation is still the current chooser
+// session.
+func (wc *WebChooser) chooseActive(generation uint64) bool {
+	wc.chooseMu.Lock()
+	defer wc.chooseMu.Unlock()
+	return wc.chooseGeneration == generation
+}
+
+// endChoose marks a chooser session as finished so that no further selections
+// are accepted for it. If a newer session has already started it is left
+// untouched.
+func (wc *WebChooser) endChoose(generation uint64) {
+	wc.chooseMu.Lock()
+	defer wc.chooseMu.Unlock()
+	if wc.chooseGeneration == generation {
+		wc.chooseGeneration++
+	}
+}
+
 func (wc *WebChooser) ChooseOp(ctx context.Context) (providers.OpenIdProvider, error) {
 	if wc.opSelected != nil {
 		return nil, fmt.Errorf("provider has already been chosen")
 	}
+
+	// Start a new chooser generation. Selections that arrive for a previous
+	// generation (e.g. from a browser tab of a cancelled chooser session) are
+	// rejected so they cannot deliver a stale provider choice into this one.
+	generation := wc.beginChoose()
+	defer wc.endChoose(generation)
 
 	providerMap := map[string]providers.BrowserOpenIdProvider{}
 	for _, provider := range wc.OpList {
@@ -177,6 +221,10 @@ func (wc *WebChooser) ChooseOp(ctx context.Context) (providers.OpenIdProvider, e
 		}
 	})
 	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticContent))))
+	// selectClaimed ensures only the first selection of this chooser
+	// generation proceeds: a duplicate navigation must not queue a second
+	// provider choice or hijack the redirect of the in-flight selection.
+	var selectClaimed atomic.Bool
 	mux.HandleFunc("/select/", func(w http.ResponseWriter, r *http.Request) {
 		// Once we redirect to the OP localhost webserver, we can shutdown the web chooser localhost server
 		shutdownServer := func() {
@@ -191,19 +239,34 @@ func (wc *WebChooser) ChooseOp(ctx context.Context) (providers.OpenIdProvider, e
 				}
 			}()
 		}
+
+		if !wc.chooseActive(generation) {
+			http.Error(w, "chooser session is no longer active", http.StatusGone)
+			return
+		}
+		if !selectClaimed.CompareAndSwap(false, true) {
+			http.Error(w, "provider selection already in progress", http.StatusConflict)
+			return
+		}
 		defer shutdownServer()
 
 		opName := r.URL.Query().Get("op")
 		if opName == "" {
 			errorString := "missing op parameter"
 			http.Error(w, errorString, http.StatusBadRequest)
-			errCh <- errors.New(errorString)
+			select {
+			case errCh <- errors.New(errorString):
+			default:
+			}
 			return
 		}
 		if op, ok := providerMap[opName]; !ok {
 			errorString := fmt.Sprintf("unknown OpenID Provider: %s", opName)
 			http.Error(w, errorString, http.StatusBadRequest)
-			errCh <- errors.New(errorString)
+			select {
+			case errCh <- errors.New(errorString):
+			default:
+			}
 			return
 		} else {
 			wc.setProviderDefaultWriters(op)
@@ -260,6 +323,15 @@ func (wc *WebChooser) ChooseOp(ctx context.Context) (providers.OpenIdProvider, e
 
 	select {
 	case <-ctx.Done():
+		// Release the chooser listener so a cancelled chooser session does
+		// not hold the port and a later ChooseOp can start cleanly. Close is
+		// used rather than a graceful Shutdown so we do not block on an
+		// in-flight selection handler.
+		if wc.server != nil {
+			if err := wc.server.Close(); err != nil {
+				_, _ = fmt.Fprintf(wc.ErrWriter(), "Failed to close HTTP server: %v\n", err)
+			}
+		}
 		return nil, ctx.Err()
 	case err := <-errCh:
 		return nil, err

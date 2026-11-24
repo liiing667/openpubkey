@@ -24,6 +24,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"time"
 
@@ -182,8 +184,12 @@ type StandardOp struct {
 	CallbackHTML      string
 	ExtraURLParamOpts map[string]string // Use this to set additional URL params on auth request to the OP (works with auth code and device flow)
 	issuer            string
-	server            *http.Server
 	loginURIHook      LoginURIHook
+	// loginMu guards loginGeneration. Each browser login attempt runs in its
+	// own generation so that callbacks left over from a cancelled or
+	// superseded attempt can be recognized and rejected.
+	loginMu         sync.Mutex
+	loginGeneration uint64
 	// browserOpener replaces util.OpenUrl in tests that exercise browser-open
 	// success and failure paths.
 	browserOpener             func(string) error
@@ -245,7 +251,42 @@ func (s *StandardOp) requestTokens(ctx context.Context, cicHash string) (*simple
 	return s.defaultRequestTokens(ctx, cicHash)
 }
 
+// beginLogin starts a new login generation and returns it. Starting a new
+// generation invalidates every earlier attempt: a callback belonging to an
+// older generation (e.g. a browser tab left over from a cancelled login) is
+// rejected instead of delivering its tokens into the current login.
+func (s *StandardOp) beginLogin() uint64 {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	s.loginGeneration++
+	return s.loginGeneration
+}
+
+// loginActive reports whether generation is still the current login attempt.
+func (s *StandardOp) loginActive(generation uint64) bool {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	return s.loginGeneration == generation
+}
+
+// endLogin marks a login attempt as finished so that no further callbacks are
+// accepted for it. If a newer attempt has already started it is left
+// untouched.
+func (s *StandardOp) endLogin(generation uint64) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	if s.loginGeneration == generation {
+		s.loginGeneration++
+	}
+}
+
 func (s *StandardOp) defaultRequestTokens(ctx context.Context, cicHash string) (*simpleoidc.Tokens, error) {
+	// Each login runs in its own generation. When this attempt ends (tokens
+	// delivered, error, or cancellation) its generation is invalidated so a
+	// late callback cannot deliver tokens into a subsequent Auth.
+	generation := s.beginLogin()
+	defer s.endLogin(generation)
+
 	redirectURI, ln, err := FindAvailablePort(s.RedirectURIs)
 	if err != nil {
 		return nil, err
@@ -254,7 +295,7 @@ func (s *StandardOp) defaultRequestTokens(ctx context.Context, cicHash string) (
 	chErr := make(chan error, 1)
 
 	mux := http.NewServeMux()
-	s.server = &http.Server{Handler: mux}
+	server := &http.Server{Handler: mux}
 
 	cookieHandler, err := configCookieHandler()
 	if err != nil {
@@ -311,9 +352,23 @@ func (s *StandardOp) defaultRequestTokens(ctx context.Context, cicHash string) (
 		return uuid.New().String()
 	}
 
+	// shutdownServer releases the callback listener. It deliberately uses a
+	// fresh context: when the login context has been cancelled we must still
+	// be able to release the listener so that a later login can rebind the
+	// same callback address.
 	shutdownServer := func() {
-		if err := s.server.Shutdown(ctx); err != nil {
+		if err := server.Shutdown(context.Background()); err != nil {
 			_, _ = fmt.Fprintf(s.ErrWriter(), "Failed to shutdown HTTP server: %v\n", err)
+		}
+	}
+	// closeServer releases the callback listener immediately, without waiting
+	// for in-flight handlers. It is used on the cancellation path, where a
+	// graceful shutdown could block forever on a handler that is itself
+	// waiting for this login to make progress (e.g. an httpSessionHook
+	// blocked on the cosigner redirect channel).
+	closeServer := func() {
+		if err := server.Close(); err != nil {
+			_, _ = fmt.Fprintf(s.ErrWriter(), "Failed to close HTTP server: %v\n", err)
 		}
 	}
 
@@ -336,18 +391,41 @@ func (s *StandardOp) defaultRequestTokens(ctx context.Context, cicHash string) (
 		),
 	)
 
+	// hookClaimed records whether the httpSessionHook has taken ownership of
+	// the HTTP server session. When it has, the hook's handler is responsible
+	// for the server shutdown and the select below must not shut the server
+	// down from under it.
+	var hookClaimed atomic.Bool
+
 	marshalToken := func(w http.ResponseWriter, r *http.Request, retTokens *oidc.Tokens[*oidc.IDTokenClaims], state string, rp rp.RelyingParty) {
-		select {
-		case chTokens <- retTokens:
-		default:
+		// Reject callbacks belonging to an earlier login generation. A stale
+		// browser tab (e.g. one left over from a cancelled login) must not
+		// deliver its tokens into this login nor trigger the current
+		// httpSessionHook.
+		if !s.loginActive(generation) {
+			http.Error(w, "login attempt is no longer active", http.StatusGone)
+			return
 		}
 
 		// If defined the OIDC client hands over control of the HTTP server session to the OpenPubkey client.
 		// Useful for redirecting the user's browser window that just finished OIDC Auth flow to the
 		// MFA Cosigner Auth URI.
 		if s.httpSessionHook != nil {
+			hookClaimed.Store(true)
+		}
+
+		select {
+		case chTokens <- retTokens:
+		default:
+		}
+
+		if s.httpSessionHook != nil {
 			s.httpSessionHook(w, r)
-			defer shutdownServer() // If no http session hook is set, we do server shutdown in RequestTokens
+			// Shut the server down without blocking this handler: a
+			// synchronous graceful Shutdown would wait for this very
+			// handler's connection to go idle, which cannot happen until
+			// the handler returns.
+			defer func() { go shutdownServer() }() // If no http session hook is set, we do server shutdown in RequestTokens
 		} else {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = w.Write([]byte(s.CallbackHTML))
@@ -358,7 +436,7 @@ func (s *StandardOp) defaultRequestTokens(ctx context.Context, cicHash string) (
 	mux.Handle(callbackPath, rp.CodeExchangeHandler(marshalToken, relyingParty))
 
 	go func() {
-		err := s.server.Serve(ln)
+		err := server.Serve(ln)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			select {
 			case chErr <- fmt.Errorf("OIDC callback server failed: %w", err):
@@ -381,24 +459,25 @@ func (s *StandardOp) defaultRequestTokens(ctx context.Context, cicHash string) (
 
 	s.presentLoginURI(loginURI)
 
-	// If httpSessionHook is not defined shutdown the server when done,
-	// otherwise keep it open for the httpSessionHook
-	// If httpSessionHook is set we handle both possible cases to ensure
-	// the server is shutdown:
-	// 1. We shut it down if an error occurs in the marshalToken handler
-	// 2. We shut it down if the marshalToken handler completes
-	if s.httpSessionHook == nil {
-		defer shutdownServer()
-	}
+	// If httpSessionHook is set, the hook takes ownership of the server
+	// session and marshalToken shuts the server down once the hook completes;
+	// hookClaimed ensures the paths below do not shut it down from under the
+	// hook. Regardless of the hook, a cancelled login always shuts the server
+	// down so the callback listener is released and a later login can rebind
+	// the same callback address.
 	select {
 	case <-ctx.Done():
+		closeServer()
 		return nil, ctx.Err()
 	case err := <-chErr:
-		if s.httpSessionHook != nil {
-			defer shutdownServer()
+		if !hookClaimed.Load() {
+			shutdownServer()
 		}
 		return nil, err
 	case retTokens := <-chTokens:
+		if !hookClaimed.Load() {
+			shutdownServer()
+		}
 		// retTokens is a zitadel/oidc struct. We turn it into our simpler token struct
 		return &simpleoidc.Tokens{
 			IDToken:      nilIfEmpty(retTokens.IDToken),
