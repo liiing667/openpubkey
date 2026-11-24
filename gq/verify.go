@@ -28,7 +28,11 @@ import (
 // Verify verifies a GQ1 signature over a message, using the public identity of the signer.
 //
 // Comments throughout refer to stages as specified in the ISO/IEC 14888-2 standard.
-func (sv *signerVerifier) Verify(proof []byte, identity []byte, message []byte) bool {
+// A nil error means the proof was accepted; otherwise the error records the
+// stage at which verification failed so callers can distinguish a malformed
+// proof, an out-of-range witness, or a failed equality check instead of
+// receiving an indistinguishable false.
+func (sv *signerVerifier) Verify(proof []byte, identity []byte, message []byte) error {
 	n, v, t := modAsInt(sv.n), sv.v, sv.t
 	nBytes, vBytes := sv.nBytes, sv.vBytes
 
@@ -37,7 +41,7 @@ func (sv *signerVerifier) Verify(proof []byte, identity []byte, message []byte) 
 	// Stage 0 - reject proof if it's the wrong size based on t
 	R, S, err := sv.decodeProof(proof)
 	if err != nil {
-		return false
+		return fmt.Errorf("error decoding GQ proof: %w", err)
 	}
 
 	// Stage 1 - create public number G
@@ -58,7 +62,7 @@ func (sv *signerVerifier) Verify(proof []byte, identity []byte, message []byte) 
 		s_i := new(big.Int).SetBytes(S[i*nBytes : (i+1)*nBytes])
 		// reject if S_i = 0 or >= n
 		if s_i.Cmp(big.NewInt(0)) == 0 || s_i.Cmp(n) != -1 {
-			return false
+			return fmt.Errorf("GQ proof witness S_%d is out of range (must be 0 < S_i < n)", i)
 		}
 		Ss[i] = s_i
 	}
@@ -81,31 +85,35 @@ func (sv *signerVerifier) Verify(proof []byte, identity []byte, message []byte) 
 	// hash W* and M and take first t*vBytes bytes as R*
 	Rstar, err := hash(t*vBytes, Wstar, M)
 	if err != nil {
-		// TODO: this can only happen if there's some error reading /dev/urandom or something
-		// so should we return the proper error?
-		return false
+		return fmt.Errorf("error hashing GQ test number and message: %w", err)
 	}
 
 	// Stage 4 - accept or reject depending on whether R and R* are identical
-	return bytes.Equal(R, Rstar)
+	if !bytes.Equal(R, Rstar) {
+		return fmt.Errorf("GQ proof is invalid: recalculated question number R* does not match the question number R in the proof")
+	}
+	return nil
 }
 
-func (sv *signerVerifier) VerifyJWT(jwt []byte) bool {
+func (sv *signerVerifier) VerifyJWT(jwt []byte) error {
 	origHeaders, err := OriginalJWTHeaders(jwt)
 	if err != nil {
-		return false
+		return fmt.Errorf("error retrieving original JWT headers: %w", err)
 	}
 
 	gqHeaders, payload, signature, err := oidc.SplitCompact(jwt)
 	if err != nil {
-		return false
+		return fmt.Errorf("error splitting GQ JWT into compact segments: %w", err)
 	}
 
 	// This ensures GQ signature covers the GQ protected header so an attacker can not alter the values in the GQ protected header
 	identity := util.JoinJWTSegments(origHeaders, payload)
 	message := util.JoinJWTSegments(gqHeaders, payload)
 
-	return sv.Verify(signature, identity, message)
+	if err := sv.Verify(signature, identity, message); err != nil {
+		return fmt.Errorf("error verifying GQ signature over JWT: %w", err)
+	}
+	return nil
 }
 
 func (sv *signerVerifier) decodeProof(s []byte) (R, S []byte, err error) {

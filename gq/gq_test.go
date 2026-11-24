@@ -48,8 +48,8 @@ func TestSignVerifyJWT(t *testing.T) {
 	gqToken, err := signerVerifier.SignJWT(idToken)
 	require.NoError(t, err)
 
-	ok := signerVerifier.VerifyJWT(gqToken)
-	require.True(t, ok, "signature verification failed")
+	err = signerVerifier.VerifyJWT(gqToken)
+	require.NoError(t, err, "signature verification failed")
 }
 
 func TestGQ256SignJWT(t *testing.T) {
@@ -61,9 +61,8 @@ func TestGQ256SignJWT(t *testing.T) {
 
 	gqToken1, err := GQ256SignJWT(&oidcPrivKey.PublicKey, idToken)
 	require.NoError(t, err)
-	ok, err := GQ256VerifyJWT(&oidcPrivKey.PublicKey, gqToken1)
+	err = GQ256VerifyJWT(&oidcPrivKey.PublicKey, gqToken1)
 	require.NoError(t, err)
-	require.True(t, ok)
 
 	// Test that we throw the correct error if the wrong RSA public key is sent to SignJWT
 	oidcPrivKeyWrong, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -147,8 +146,8 @@ func TestVerifyModifiedIdPayload(t *testing.T) {
 	gqToken, err := signerVerifier.SignJWT(modifiedToken)
 	require.NoError(t, err)
 
-	ok := signerVerifier.VerifyJWT(gqToken)
-	require.False(t, ok, "GQ signature verification passed for invalid payload")
+	err = signerVerifier.VerifyJWT(gqToken)
+	require.Error(t, err, "GQ signature verification passed for invalid payload")
 }
 
 func TestVerifyModifiedGqPayload(t *testing.T) {
@@ -168,8 +167,8 @@ func TestVerifyModifiedGqPayload(t *testing.T) {
 	modifiedToken, err := modifyTokenPayload(gqToken, "fail")
 	require.NoError(t, err)
 
-	ok := signerVerifier.VerifyJWT(modifiedToken)
-	require.False(t, ok, "GQ signature verification passed for invalid payload")
+	err = signerVerifier.VerifyJWT(modifiedToken)
+	require.Error(t, err, "GQ signature verification passed for invalid payload")
 
 }
 
@@ -204,10 +203,10 @@ func TestVerifyModifiedGqProtectedHeader(t *testing.T) {
 			require.NoError(t, err)
 			require.NotEqual(t, string(gqToken), modifiedToken, "expected token to be modified but token unchanged")
 
-			ok := signerVerifier.VerifyJWT(modifiedToken)
-			// If ok is true, it means that signature verification is not working correctly
-			//  as altering the message should break the signature.
-			require.False(t, ok, "verify passed for tampered %s", tt.claimToModify)
+			err = signerVerifier.VerifyJWT(modifiedToken)
+			// If err is nil it means that signature verification is not working
+			// correctly as altering the message should break the signature.
+			require.Error(t, err, "verify passed for tampered %s", tt.claimToModify)
 		})
 	}
 
@@ -239,8 +238,8 @@ func TestVerifyModifiedGqProtectedHeader(t *testing.T) {
 	modifiedGqToken := util.JoinJWTSegments(modifiedGqHeaders, payload, signature)
 	require.NotEqual(t, string(gqToken), modifiedGqToken, "modified token should not equal original token")
 
-	ok := signerVerifier.VerifyJWT(modifiedGqToken)
-	require.False(t, ok, "verify passed for tampered token")
+	err = signerVerifier.VerifyJWT(modifiedGqToken)
+	require.Error(t, err, "verify passed for tampered token")
 }
 
 func TestNewSignerVerifierRejectsInvalidExponents(t *testing.T) {
@@ -297,8 +296,8 @@ func TestSignVerifyJWTWithExponentE3(t *testing.T) {
 	gqToken, err := sv.SignJWT(idToken)
 	require.NoError(t, err)
 
-	ok := sv.VerifyJWT(gqToken)
-	require.True(t, ok, "GQ sign+verify with E=3 failed")
+	err = sv.VerifyJWT(gqToken)
+	require.NoError(t, err, "GQ sign+verify with E=3 failed")
 }
 
 // generateTestRSAKeyWithExponent generates an RSA key with the given public exponent.
@@ -479,4 +478,82 @@ func getClaimInProtected(claimKey string, token []byte) (any, bool, error) {
 		return nil, false, nil //nolint:nilerr // error is intentionally discarded
 	}
 	return claimValue, true, nil
+}
+
+// TestVerifyReturnsStageSpecificErrors ensures that verification failures are
+// returned as errors naming the failing stage instead of collapsing into a
+// silent false deep inside the verifier.
+func TestVerifyReturnsStageSpecificErrors(t *testing.T) {
+	oidcPrivKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	idToken, err := createOIDCToken(oidcPrivKey, "test")
+	require.NoError(t, err)
+
+	sv, err := NewSignerVerifier(&oidcPrivKey.PublicKey, 256)
+	require.NoError(t, err)
+
+	gqToken, err := sv.SignJWT(idToken)
+	require.NoError(t, err)
+
+	// A correctly formed proof verifies without error
+	require.NoError(t, sv.VerifyJWT(gqToken))
+
+	gqHeaders, payload, proof, err := oidc.SplitCompact(gqToken)
+	require.NoError(t, err)
+
+	origHeaders, err := OriginalJWTHeaders(gqToken)
+	require.NoError(t, err)
+
+	identity := util.JoinJWTSegments(origHeaders, payload)
+	message := util.JoinJWTSegments(gqHeaders, payload)
+
+	t.Run("malformed proof is not valid base64", func(t *testing.T) {
+		err := sv.Verify([]byte("not base64!!!"), identity, message)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "error decoding GQ proof")
+	})
+
+	t.Run("proof of the wrong size is rejected at decode stage", func(t *testing.T) {
+		decoded, err := util.Base64DecodeForJWT(proof)
+		require.NoError(t, err)
+		wrongSize := util.Base64EncodeForJWT(append(decoded, 0x00))
+		err = sv.Verify(wrongSize, identity, message)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "error decoding GQ proof")
+	})
+
+	t.Run("tampered proof fails the question number equality check", func(t *testing.T) {
+		decoded, err := util.Base64DecodeForJWT(proof)
+		require.NoError(t, err)
+
+		// Flip a byte inside the question number R, leaving the proof length
+		// untouched so the failure occurs at the final equality stage.
+		tampered := make([]byte, len(decoded))
+		copy(tampered, decoded)
+		tampered[0] ^= 0x01
+
+		err = sv.Verify(util.Base64EncodeForJWT(tampered), identity, message)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "GQ proof is invalid")
+	})
+
+	t.Run("witness equal to the modulus is rejected as out of range", func(t *testing.T) {
+		decoded, err := util.Base64DecodeForJWT(proof)
+		require.NoError(t, err)
+
+		concrete := sv.(*signerVerifier)
+		rSize := concrete.vBytes * concrete.t
+
+		// Replace the first witness S_0 with n, which is never a valid
+		// witness (a witness must be strictly less than n).
+		tampered := make([]byte, len(decoded))
+		copy(tampered, decoded)
+		nBytes := modAsInt(concrete.n).FillBytes(make([]byte, concrete.nBytes))
+		copy(tampered[rSize:rSize+concrete.nBytes], nBytes)
+
+		err = sv.Verify(util.Base64EncodeForJWT(tampered), identity, message)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "out of range")
+	})
 }

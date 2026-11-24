@@ -81,12 +81,12 @@ func GQ256SignJWT(rsaPublicKey *rsa.PublicKey, jwt []byte, opts ...Opts) ([]byte
 }
 
 // GQ256VerifyJWT verifies a GQ1 signature over GQ signed JWT
-func GQ256VerifyJWT(rsaPublicKey *rsa.PublicKey, gqToken []byte) (bool, error) {
+func GQ256VerifyJWT(rsaPublicKey *rsa.PublicKey, gqToken []byte) error {
 	sv, err := New256SignerVerifier(rsaPublicKey)
 	if err != nil {
-		return false, fmt.Errorf("error creating GQ signer: %w", err)
+		return fmt.Errorf("error creating GQ signer: %w", err)
 	}
-	return sv.VerifyJWT(gqToken), nil
+	return sv.VerifyJWT(gqToken)
 }
 
 // Signer allows for creating GQ1 signatures messages.
@@ -101,11 +101,15 @@ type Signer interface {
 
 // Signer allows for verifying GQ1 signatures.
 type Verifier interface {
-	// Verify verifies a GQ1 signature over a message, using the public identity of the signer.
-	Verify(signature []byte, identity []byte, message []byte) bool
+	// Verify verifies a GQ1 signature over a message, using the public
+	// identity of the signer. It returns nil when the proof is valid and an
+	// error describing the failing verification stage otherwise.
+	Verify(signature []byte, identity []byte, message []byte) error
 
-	// Compatible with SignJWT, this function verifies the GQ1 signature of the presented JSON Web Token.
-	VerifyJWT(jwt []byte) bool
+	// Compatible with SignJWT, this function verifies the GQ1 signature of
+	// the presented JSON Web Token. It returns nil on success and an error
+	// describing the failing verification stage otherwise.
+	VerifyJWT(jwt []byte) error
 }
 
 // SignerVerifier combines the Signer and Verifier interfaces.

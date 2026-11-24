@@ -123,9 +123,8 @@ func TestClient(t *testing.T) {
 				rsaKey, ok := opPubKey.PublicKey.(*rsa.PublicKey)
 				require.Equal(t, true, ok)
 
-				ok, err = gq.GQ256VerifyJWT(rsaKey, pkt.OpToken)
+				err = gq.GQ256VerifyJWT(rsaKey, pkt.OpToken)
 				require.NoError(t, err, tc.name)
-				require.True(t, ok, "error verifying OP GQ signature on PK Token (ID Token invalid)")
 			} else {
 				// Expect alg to be RS256 alg when not signing with GQ
 				require.Equal(t, jose.RS256, providerAlg, tc.name)

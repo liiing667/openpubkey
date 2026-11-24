@@ -254,8 +254,16 @@ func (f *PublicKeyFinder) fetchAndParseJwks(ctx context.Context, issuer string, 
 
 // ByToken looks up the OP public key for the supplied token. It keeps only the
 // keys published for the token's alg, then picks the one with the token's kid
-// (see ByKeyID for tokens without a kid). For a GQ token the alg and kid of the
-// original token are used.
+// (see ByKeyID for tokens without a kid).
+//
+// For a GQ token the key is selected using the GQ protected header's "jkt"
+// (JWK thumbprint) claim: the GQ signature covers the GQ protected header, so
+// the thumbprint is bound to the proof and cannot be altered without
+// invalidating it. Selecting the key through the thumbprint therefore binds
+// the original headers, the payload, the proof and the issuer's JWKS to the
+// same key before any key is chosen. GQ tokens that predate the "jkt" claim
+// (legacy tokens) fall back to the alg and kid carried in the original
+// headers embedded in the GQ "kid" header.
 func (f *PublicKeyFinder) ByToken(ctx context.Context, issuer string, token []byte, mayUseCache bool) (*PublicKeyRecord, error) {
 	jwt, err := jws.Parse(token)
 	emptyPkr := &PublicKeyRecord{WasCached: false}
@@ -271,6 +279,19 @@ func (f *PublicKeyFinder) ByToken(ctx context.Context, issuer string, token []by
 	}
 	keyID, _ := headers.KeyID()
 	if headersAlg.String() == jose.GQ256 {
+		// The GQ "jkt" protected header claim is the JWK thumbprint of the
+		// issuer key that signed the original (pre-GQ) token. It is covered
+		// by the GQ signature, so selecting the key through the thumbprint
+		// does not rely on the mutable original headers embedded in the GQ
+		// "kid" and binds the token's proof, headers, payload and the
+		// issuer's JWKS to the same key.
+		var jkt string
+		if err := headers.Get("jkt", &jkt); err == nil && jkt != "" {
+			return f.ByJKT(ctx, issuer, jkt, mayUseCache)
+		}
+
+		// Legacy GQ tokens carry no "jkt" claim. Fall back to selecting the
+		// key through the original token's alg and kid.
 		origHeadersJson, err := util.Base64DecodeForJWT([]byte(keyID))
 		if err != nil {
 			return emptyPkr, fmt.Errorf("error base64 decoding GQ kid: %w", err)

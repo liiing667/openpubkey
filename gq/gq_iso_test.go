@@ -86,9 +86,9 @@ func TestVerifierISO(t *testing.T) {
 	}()
 
 	encodedSigISO := util.Base64EncodeForJWT(sigISO)
-	ok := svISO.Verify(encodedSigISO, idISO, mISO)
+	err := svISO.Verify(encodedSigISO, idISO, mISO)
 
-	require.True(t, ok, "Signature verification failed")
+	require.NoError(t, err, "Signature verification failed")
 }
 
 func init() {

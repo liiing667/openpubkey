@@ -25,7 +25,6 @@ import (
 )
 
 var result error
-var boolResult bool
 
 type testTuple struct {
 	rsaPublicKey *rsa.PublicKey
@@ -72,17 +71,18 @@ func BenchmarkVerifying(b *testing.B) {
 	// Reset the benchmark timer to exclude setup time
 	b.ResetTimer()
 
-	var ok bool
 	for i := range b.N {
 		signerVerifier, err := NewSignerVerifier(matrix[i].rsaPublicKey, 256)
 		require.NoError(b, err)
-		ok = signerVerifier.VerifyJWT(gqSignedTokens[i])
-		require.True(b, ok, "Failed to verify signature!")
+		result = signerVerifier.VerifyJWT(gqSignedTokens[i])
+		require.NoError(b, result, "Failed to verify signature!")
 	}
 
 	// Avoid compiler optimisations eliminating the function under test and artificially lowering the run time of the benchmark
 	// ref: https://dave.cheney.net/2013/06/30/how-to-write-benchmarks-in-go
-	boolResult = ok
+	if result != nil {
+		b.Fatal(result)
+	}
 }
 
 func generateTestMatrix(n int) ([]testTuple, error) {

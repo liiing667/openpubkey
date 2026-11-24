@@ -394,12 +394,25 @@ func (v *DefaultProviderVerifier) verifyGQSigAgainstIssuer(ctx context.Context, 
 	if !ok {
 		return publicKeyRecord.WasCached, fmt.Errorf("jwk is not an RSA key")
 	}
-	ok, err = gq.GQ256VerifyJWT(rsaKey, idt.GetRaw())
-	if err != nil {
-		return publicKeyRecord.WasCached, err
+
+	// Bind the key the JWKS handed us to the GQ token's identity. New GQ
+	// tokens carry the signing key's JWK thumbprint in the GQ protected
+	// "jkt" header claim (covered by the GQ signature); require it to match
+	// the thumbprint of the key we are about to verify with so the original
+	// headers, payload, proof and JWKS cannot come from different identities.
+	jktClaim := idt.GetSignature().GetProtectedClaims().Jkt
+	if jktClaim != "" {
+		jktOfKey, err := createJkt(rsaKey)
+		if err != nil {
+			return publicKeyRecord.WasCached, fmt.Errorf("error computing JWK thumbprint of provider key: %w", err)
+		}
+		if jktClaim != jktOfKey {
+			return publicKeyRecord.WasCached, fmt.Errorf("jkt claim in GQ token (%s) does not match thumbprint of the issuer's key (%s)", jktClaim, jktOfKey)
+		}
 	}
-	if !ok {
-		return publicKeyRecord.WasCached, fmt.Errorf("error verifying OP GQ signature on PK Token (ID Token invalid)")
+
+	if err = gq.GQ256VerifyJWT(rsaKey, idt.GetRaw()); err != nil {
+		return publicKeyRecord.WasCached, err
 	}
 	return publicKeyRecord.WasCached, nil
 }

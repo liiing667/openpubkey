@@ -1403,3 +1403,99 @@ func TestByTokenSkipsEncryptionKeyWithSameKid(t *testing.T) {
 	require.Equal(t, sigKey.Public(), pubkeyRecord.PublicKey)
 	require.Contains(t, warnings.String(), `key is published for use "enc"`)
 }
+
+// jktOfKey returns the base64url-encoded SHA-256 JWK thumbprint of key, the
+// same value providers.CreateGQToken places in the GQ "jkt" protected header.
+func jktOfKey(t *testing.T, key crypto.PublicKey) string {
+	t.Helper()
+	jwkKey, err := jwk.PublicKeyOf(key)
+	require.NoError(t, err)
+	thumbprint, err := jwkKey.Thumbprint(crypto.SHA256)
+	require.NoError(t, err)
+	return string(util.Base64EncodeForJWT(thumbprint))
+}
+
+// signGQWithJkt builds a GQ token that carries the signing key's JWK
+// thumbprint in its GQ protected "jkt" header claim, mirroring how the
+// providers package signs production GQ tokens.
+func signGQWithJkt(t *testing.T, rsaKey *rsa.PrivateKey, idToken []byte) []byte {
+	t.Helper()
+	gqToken, err := gq.GQ256SignJWT(&rsaKey.PublicKey, idToken,
+		gq.WithExtraClaim("jkt", jktOfKey(t, &rsaKey.PublicKey)))
+	require.NoError(t, err)
+	return gqToken
+}
+
+// TestByTokenGQSelectsKeyByJkt verifies that a GQ token's key is selected via
+// the GQ protected "jkt" claim rather than the kid embedded in the original
+// headers, binding the proof and the issuer's JWKS to the same identity.
+func TestByTokenGQSelectsKeyByJkt(t *testing.T) {
+	ctx := context.Background()
+	issuer := "testIssuer"
+
+	keyA, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	keyB, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	// Both keys share the same kid, so kid-based lookup could return either.
+	// The jkt claim must disambiguate and select the exact signing key.
+	jwks := jwksOf(
+		publicJwkEntry(t, keyA.Public(), "RS256", "shared"),
+		publicJwkEntry(t, keyB.Public(), "RS256", "shared"),
+	)
+	finder := &PublicKeyFinder{JwksFunc: NewMockJwksSource(jwks).Fetch}
+
+	idToken := CreateIDToken(t, issuer, keyB, "RS256", "shared")
+	gqToken := signGQWithJkt(t, keyB, idToken)
+
+	pubkeyRecord, err := finder.ByToken(ctx, issuer, gqToken, false)
+	require.NoError(t, err)
+	require.Equal(t, keyB.Public(), pubkeyRecord.PublicKey, "GQ key must be selected via the jkt claim, not the shared kid")
+}
+
+// TestByTokenGQJktNotInJWKS verifies that a GQ token whose jkt does not match
+// any key published by the issuer cannot be verified against a different key.
+func TestByTokenGQJktNotInJWKS(t *testing.T) {
+	ctx := context.Background()
+	issuer := "testIssuer"
+
+	signingKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	// The JWKS only contains a different key, even though the embedded
+	// original headers point at the signing key's kid.
+	jwks := jwksOf(publicJwkEntry(t, otherKey.Public(), "RS256", "kid-0"))
+	finder := &PublicKeyFinder{JwksFunc: NewMockJwksSource(jwks).Fetch}
+
+	idToken := CreateIDToken(t, issuer, signingKey, "RS256", "kid-0")
+	gqToken := signGQWithJkt(t, signingKey, idToken)
+
+	_, err = finder.ByToken(ctx, issuer, gqToken, false)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "no matching public key found for jkt")
+}
+
+// TestByTokenLegacyGQTokenFallsBackToKid verifies that GQ tokens produced
+// before the "jkt" protected header claim existed can still be read by
+// falling back to the alg and kid in the embedded original headers.
+func TestByTokenLegacyGQTokenFallsBackToKid(t *testing.T) {
+	ctx := context.Background()
+	issuer := "testIssuer"
+
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	jwks := jwksOf(publicJwkEntry(t, rsaKey.Public(), "RS256", "kid-0"))
+	finder := &PublicKeyFinder{JwksFunc: NewMockJwksSource(jwks).Fetch}
+
+	// GQ256SignJWT without a jkt extra claim produces a legacy GQ token.
+	idToken := CreateIDToken(t, issuer, rsaKey, "RS256", "kid-0")
+	legacyGQToken, err := gq.GQ256SignJWT(&rsaKey.PublicKey, idToken)
+	require.NoError(t, err)
+
+	pubkeyRecord, err := finder.ByToken(ctx, issuer, legacyGQToken, false)
+	require.NoError(t, err)
+	require.Equal(t, rsaKey.Public(), pubkeyRecord.PublicKey)
+}

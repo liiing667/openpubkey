@@ -39,6 +39,7 @@ import (
 	"github.com/lestrrat-go/jwx/v3/jws"
 	"github.com/openpubkey/openpubkey/discover"
 	"github.com/openpubkey/openpubkey/gq"
+	"github.com/openpubkey/openpubkey/oidc"
 	"github.com/openpubkey/openpubkey/pktoken/clientinstance"
 	"github.com/openpubkey/openpubkey/providers/mocks"
 	"github.com/openpubkey/openpubkey/util"
@@ -951,4 +952,148 @@ func TestVerifyIDTokenRejectsEncryptionKey(t *testing.T) {
 	pv := nonceCommitmentVerifier(issuer, clientID, &discover.PublicKeyFinder{JwksFunc: discover.NewMockJwksSource(jwks).Fetch})
 	err = pv.VerifyIDToken(context.Background(), idToken, cic)
 	require.ErrorContains(t, err, `key is published for use "enc", not "sig"`)
+}
+
+// TestVerifyGQTokenRejectsMismatchedJkt ensures that a GQ token cannot be
+// verified against an issuer key whose thumbprint differs from the "jkt"
+// claim covered by the GQ signature: the original headers, payload, proof
+// and JWKS must all be bound to the same identity.
+func TestVerifyGQTokenRejectsMismatchedJkt(t *testing.T) {
+	issuer := "https://issuer.example"
+	clientID := "test-client-id"
+
+	signingKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	cic := GenCIC(t)
+	idToken := signIDToken(t, signingKey, "RS256", "kid-0",
+		nonceIDTokenPayload(t, issuer, clientID, cic))
+
+	// The GQ token commits to the signing key's thumbprint in its protected
+	// "jkt" header, but the issuer's JWKS only contains a different key.
+	gqToken, err := gq.GQ256SignJWT(&signingKey.PublicKey, idToken,
+		gq.WithExtraClaim("jkt", mustCreateJkt(t, &signingKey.PublicKey)))
+	require.NoError(t, err)
+
+	jwks := jwksOfKeys(t, jwkEntry{pubKey: otherKey.Public(), alg: "RS256", kid: "kid-0"})
+	pv := nonceCommitmentVerifier(issuer, clientID,
+		&discover.PublicKeyFinder{JwksFunc: discover.NewMockJwksSource(jwks).Fetch})
+
+	err = pv.VerifyIDToken(context.Background(), gqToken, cic)
+	require.Error(t, err)
+	// Key selection by jkt fails before any signature check because the
+	// thumbprint does not identify any key in the JWKS.
+	require.ErrorContains(t, err, "no matching public key found for jkt")
+}
+
+// TestVerifyGQTokenTamperedJktRejected ensures that tampering with the "jkt"
+// protected header claim breaks the GQ signature and that the failure is
+// returned as an error rather than a silent false.
+func TestVerifyGQTokenTamperedJktRejected(t *testing.T) {
+	issuer := "https://issuer.example"
+	clientID := "test-client-id"
+
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	jwks := jwksOfKeys(t, jwkEntry{pubKey: rsaKey.Public(), alg: "RS256", kid: "kid-0"})
+	finder := &discover.PublicKeyFinder{JwksFunc: discover.NewMockJwksSource(jwks).Fetch}
+	pv := nonceCommitmentVerifier(issuer, clientID, finder)
+
+	cic := GenCIC(t)
+	idToken := signIDToken(t, rsaKey, "RS256", "kid-0",
+		nonceIDTokenPayload(t, issuer, clientID, cic))
+	gqToken, err := gq.GQ256SignJWT(&rsaKey.PublicKey, idToken,
+		gq.WithExtraClaim("jkt", mustCreateJkt(t, &rsaKey.PublicKey)))
+	require.NoError(t, err)
+
+	// Sanity check: the untampered GQ token verifies.
+	require.NoError(t, pv.VerifyIDToken(context.Background(), gqToken, cic))
+
+	// Replace the jkt claim with another key's thumbprint without re-signing.
+	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	tampered, err := replaceGQHeaderClaim(t, gqToken, "jkt", mustCreateJkt(t, &otherKey.PublicKey))
+	require.NoError(t, err)
+
+	err = pv.VerifyIDToken(context.Background(), tampered, cic)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "error verifying OP GQ signature")
+}
+
+// TestVerifyGQTokenMalformedProofReturnsError ensures that a malformed proof
+// deep in the GQ verifier surfaces as a stage-specific error to the caller.
+func TestVerifyGQTokenMalformedProofReturnsError(t *testing.T) {
+	issuer := "https://issuer.example"
+	clientID := "test-client-id"
+
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	jwks := jwksOfKeys(t, jwkEntry{pubKey: rsaKey.Public(), alg: "RS256", kid: "kid-0"})
+	finder := &discover.PublicKeyFinder{JwksFunc: discover.NewMockJwksSource(jwks).Fetch}
+	pv := nonceCommitmentVerifier(issuer, clientID, finder)
+
+	cic := GenCIC(t)
+	idToken := signIDToken(t, rsaKey, "RS256", "kid-0",
+		nonceIDTokenPayload(t, issuer, clientID, cic))
+	gqToken, err := gq.GQ256SignJWT(&rsaKey.PublicKey, idToken,
+		gq.WithExtraClaim("jkt", mustCreateJkt(t, &rsaKey.PublicKey)))
+	require.NoError(t, err)
+
+	headersB64, payload, _, splitErr := oidc.SplitCompact(gqToken)
+	require.NoError(t, splitErr)
+	malformed := util.JoinJWTSegments(headersB64, payload, util.Base64EncodeForJWT([]byte("not-a-valid-proof")))
+
+	err = pv.VerifyIDToken(context.Background(), malformed, cic)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "error decoding GQ proof")
+}
+
+// TestVerifyLegacyGQTokenWithoutJkt ensures that GQ tokens predating the "jkt"
+// protected header claim can still be read and verified via the kid-based
+// fallback.
+func TestVerifyLegacyGQTokenWithoutJkt(t *testing.T) {
+	issuer := "https://issuer.example"
+	clientID := "test-client-id"
+
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	jwks := jwksOfKeys(t, jwkEntry{pubKey: rsaKey.Public(), alg: "RS256", kid: "kid-0"})
+	finder := &discover.PublicKeyFinder{JwksFunc: discover.NewMockJwksSource(jwks).Fetch}
+	pv := nonceCommitmentVerifier(issuer, clientID, finder)
+
+	cic := GenCIC(t)
+	idToken := signIDToken(t, rsaKey, "RS256", "kid-0",
+		nonceIDTokenPayload(t, issuer, clientID, cic))
+
+	// No jkt extra claim: this is the shape of legacy GQ tokens.
+	legacyGQToken, err := gq.GQ256SignJWT(&rsaKey.PublicKey, idToken)
+	require.NoError(t, err)
+
+	require.NoError(t, pv.VerifyIDToken(context.Background(), legacyGQToken, cic))
+}
+
+func mustCreateJkt(t *testing.T, publicKey crypto.PublicKey) string {
+	t.Helper()
+	jkt, err := createJkt(publicKey)
+	require.NoError(t, err)
+	return jkt
+}
+
+func replaceGQHeaderClaim(t *testing.T, token []byte, claim, value string) ([]byte, error) {
+	t.Helper()
+	headersB64, payload, proof, err := oidc.SplitCompact(token)
+	require.NoError(t, err)
+
+	headersJSON, err := util.Base64DecodeForJWT(headersB64)
+	require.NoError(t, err)
+
+	headers := map[string]any{}
+	require.NoError(t, json.Unmarshal(headersJSON, &headers))
+	headers[claim] = value
+	newHeaders, err := json.Marshal(headers)
+	require.NoError(t, err)
+
+	return util.JoinJWTSegments(util.Base64EncodeForJWT(newHeaders), payload, proof), nil
 }

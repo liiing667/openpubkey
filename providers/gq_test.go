@@ -118,9 +118,8 @@ func TestGQ(t *testing.T) {
 				require.NotNil(t, gqToken)
 
 				// Check that GQ Signature verifies
-				verifies, err := gq.GQ256VerifyJWT(expPublicKey.(*rsa.PublicKey), gqToken)
+				err = gq.GQ256VerifyJWT(expPublicKey.(*rsa.PublicKey), gqToken)
 				require.NoError(t, err)
-				require.True(t, verifies)
 
 				jwt, err := oidc.NewJwt(gqToken)
 				require.NoError(t, err)

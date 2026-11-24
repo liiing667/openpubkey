@@ -104,9 +104,8 @@ func TestGithubOpTableTest(t *testing.T) {
 	rsaKey, ok := pkRecord.PublicKey.(*rsa.PublicKey)
 
 	require.True(t, ok)
-	ok, err = gq.GQ256VerifyJWT(rsaKey, idToken)
+	err = gq.GQ256VerifyJWT(rsaKey, idToken)
 	require.NoError(t, err)
-	require.True(t, ok)
 }
 
 // These two tests are regression tests for  deserialization bug
@@ -236,9 +235,8 @@ func TestGithubOpFullGQ(t *testing.T) {
 	// Check that GQ Signature verifies
 	rsaKey, ok := signingKey.Public().(*rsa.PublicKey)
 	require.True(t, ok)
-	ok, err = gq.GQ256VerifyJWT(rsaKey, idToken)
+	err = gq.GQ256VerifyJWT(rsaKey, idToken)
 	require.NoError(t, err)
-	require.True(t, ok)
 }
 
 // Simple test to ensure we don't accidentally break this simple function
