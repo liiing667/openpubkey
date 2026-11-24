@@ -78,17 +78,45 @@ func (c *AuthCosigner) RedeemAuthcode(sig []byte) ([]byte, error) {
 	}
 	authcode := string(msg.Payload())
 
-	// We need redemption to be inside of our mutexes to ensure the same authcode can't be redeemed if requested at the same moment
-	if authState, authID, err := c.AuthStateStore.RedeemAuthcode(authcode); err != nil {
-		return nil, err
-	} else {
+	// Verification, identity binding, consumption of the authcode and
+	// publication of the cosignature all happen in this callback. The store
+	// runs it in a transaction: an invalid signature or a signing failure
+	// leaves the authcode available, while a successful call commits both the
+	// consumed flag and the cosignature at once.
+	redeem := func(authState AuthState, authID string) ([]byte, error) {
 		pkt := authState.Pkt
-		_, err := pkt.VerifySignedMessage(sig) // We check this after redeeming the authcode, so can't try the same correct authcode twice
-		if err != nil {
+		if pkt == nil {
+			return nil, fmt.Errorf("auth session has no PK Token")
+		}
+		if _, err := pkt.VerifySignedMessage(sig); err != nil {
 			return nil, fmt.Errorf("error verifying sig: %w", err)
 		}
 		return c.IssueSignature(pkt, authState, authID)
 	}
+
+	if txStore, ok := c.AuthStateStore.(AuthcodeTransactionStore); ok {
+		return txStore.RedeemAuthcodeTx(authcode, redeem)
+	}
+
+	// Preserve compatibility with stores that only implement the original
+	// interface. RedeemAuthcode consumes the authcode before we get a chance
+	// to verify the signature, so roll it back if verification or signing
+	// fails. Stores should implement AuthcodeTransactionStore to make this
+	// atomic and to survive a crash.
+	authState, authID, err := c.AuthStateStore.RedeemAuthcode(authcode)
+	if err != nil {
+		return nil, err
+	}
+	cosSig, err := redeem(authState, authID)
+	if err != nil {
+		authState.AuthcodeRedeemed = false
+		authState.CosSignature = nil
+		if updateErr := c.AuthStateStore.UpdateAuthState(authID, authState); updateErr != nil {
+			return nil, fmt.Errorf("%w (failed to roll back authcode consumption: %v)", err, updateErr)
+		}
+		return nil, err
+	}
+	return cosSig, nil
 }
 
 func (c *AuthCosigner) IssueSignature(pkt *pktoken.PKToken, authState AuthState, authID string) ([]byte, error) {

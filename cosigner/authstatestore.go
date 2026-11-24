@@ -27,3 +27,22 @@ type AuthStateStore interface {
 	CreateAuthcode(authID string) (authcode string, err error)
 	RedeemAuthcode(authcode string) (authState AuthState, authID string, err error)
 }
+
+// AuthcodeTransactionStore is an optional extension implemented by stores
+// that can redeem an authcode transactionally.
+//
+// RedeemAuthcodeTx must run redeem while the authcode is still unused, and
+// must publish the returned cosignature and mark the authcode as redeemed in
+// one atomic commit. If redeem returns an error, or the commit fails, the
+// authcode must remain unused so that it can be retried. Implementations must
+// also ensure that concurrent redemptions of the same authcode can produce at
+// most one committed cosignature.
+//
+// redeem is called while the store holds its transaction lock. It must not
+// call back into the store.
+type AuthcodeTransactionStore interface {
+	RedeemAuthcodeTx(
+		authcode string,
+		redeem func(authState AuthState, authID string) ([]byte, error),
+	) ([]byte, error)
+}

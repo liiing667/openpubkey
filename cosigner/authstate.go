@@ -35,7 +35,12 @@ type AuthState struct {
 	RedirectURI      string // Redirect URI
 	Nonce            string // Nonce supplied by user
 	AuthcodeIssued   bool   // Has an authcode been issued for this auth session
-	AuthcodeRedeemed bool   // Was the pkt cosigned
+	AuthcodeRedeemed bool   // Has the authcode been consumed by a successful cosigning transaction
+	// CosSignature is the cosigner signature committed together with
+	// AuthcodeRedeemed. Keeping it in the auth state makes the cosignature
+	// publish atomic with the one-time authcode consumption and leaves an
+	// auditable record that survives a restart.
+	CosSignature []byte
 }
 
 func NewAuthState(pkt *pktoken.PKToken, ruri string, nonce string) (*AuthState, error) {

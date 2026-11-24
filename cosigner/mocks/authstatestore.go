@@ -40,6 +40,8 @@ type AuthStateInMemoryStore struct {
 	AuthcodeMapLock  sync.RWMutex
 }
 
+var _ cosigner.AuthcodeTransactionStore = (*AuthStateInMemoryStore)(nil)
+
 func NewAuthStateInMemoryStore(hmacKey []byte) *AuthStateInMemoryStore {
 	return &AuthStateInMemoryStore{
 		AuthStateMap:     make(map[string]*cosigner.AuthState),
@@ -50,12 +52,28 @@ func NewAuthStateInMemoryStore(hmacKey []byte) *AuthStateInMemoryStore {
 	}
 }
 
-// Writes to the AuthState are not concurrency safe, do not write
+// cloneAuthState copies the mutable parts of an AuthState so callers cannot
+// mutate store state without going through the store.
+func cloneAuthState(authState *cosigner.AuthState) cosigner.AuthState {
+	if authState == nil {
+		return cosigner.AuthState{}
+	}
+	cloned := *authState
+	if authState.CosSignature != nil {
+		cloned.CosSignature = append([]byte(nil), authState.CosSignature...)
+	}
+	return cloned
+}
+
 func (s *AuthStateInMemoryStore) LookupAuthState(authID string) (*cosigner.AuthState, bool) {
 	s.AuthStateMapLock.RLock()
-	as, ok := s.AuthStateMap[authID]
+	authState, ok := s.AuthStateMap[authID]
 	s.AuthStateMapLock.RUnlock()
-	return as, ok // Pass by value to prevent writes to the original
+	if !ok {
+		return nil, false
+	}
+	cloned := cloneAuthState(authState)
+	return &cloned, true
 }
 
 func (s *AuthStateInMemoryStore) UpdateAuthState(authID string, authState cosigner.AuthState) error {
@@ -65,7 +83,8 @@ func (s *AuthStateInMemoryStore) UpdateAuthState(authID string, authState cosign
 	if _, ok := s.AuthStateMap[authID]; !ok {
 		return fmt.Errorf("failed to upload auth session because authID specified matches no session")
 	} else {
-		s.AuthStateMap[authID] = &authState
+		cloned := cloneAuthState(&authState)
+		s.AuthStateMap[authID] = &cloned
 		return nil
 	}
 }
@@ -119,11 +138,11 @@ func (s *AuthStateInMemoryStore) CreateNewAuthSession(pkt *pktoken.PKToken, ruri
 		return "", err
 	} else {
 		s.AuthStateMapLock.Lock()
+		defer s.AuthStateMapLock.Unlock()
 		if _, ok := s.AuthStateMap[authID]; ok {
 			return "", fmt.Errorf("specified authID is already in use")
 		}
 		s.AuthStateMap[authID] = authState
-		s.AuthStateMapLock.Unlock()
 		return authID, nil
 	}
 }
@@ -158,24 +177,78 @@ func (s *AuthStateInMemoryStore) CreateAuthcode(authID string) (string, error) {
 }
 
 func (s *AuthStateInMemoryStore) RedeemAuthcode(authcode string) (cosigner.AuthState, string, error) {
-	s.AuthcodeMapLock.RLock()
+	s.AuthStateMapLock.Lock()
+	defer s.AuthStateMapLock.Unlock()
+	s.AuthcodeMapLock.Lock()
+	defer s.AuthcodeMapLock.Unlock()
+
+	return s.redeemAuthcodeLocked(authcode)
+}
+
+// RedeemAuthcodeTx implements cosigner.AuthcodeTransactionStore. The callback
+// and the commit both run while the store lock is held, so a failed callback
+// leaves no trace and concurrent callers cannot both publish a cosignature.
+func (s *AuthStateInMemoryStore) RedeemAuthcodeTx(
+	authcode string,
+	redeem func(authState cosigner.AuthState, authID string) ([]byte, error),
+) ([]byte, error) {
+	s.AuthStateMapLock.Lock()
+	defer s.AuthStateMapLock.Unlock()
+	s.AuthcodeMapLock.Lock()
+	defer s.AuthcodeMapLock.Unlock()
+
+	authState, authID, err := s.checkRedeemableAuthcodeLocked(authcode)
+	if err != nil {
+		return nil, err
+	}
+
+	cosSig, err := redeem(authState, authID)
+	if err != nil {
+		return nil, err
+	}
+
+	stored := s.AuthStateMap[authID]
+	stored.AuthcodeRedeemed = true
+	stored.CosSignature = append([]byte(nil), cosSig...)
+	return append([]byte(nil), cosSig...), nil
+}
+
+// redeemAuthcodeLocked checks and consumes an authcode. The caller must hold
+// both AuthStateMapLock and AuthcodeMapLock.
+func (s *AuthStateInMemoryStore) redeemAuthcodeLocked(authcode string) (cosigner.AuthState, string, error) {
+	authState, authID, err := s.checkRedeemableAuthcodeLocked(authcode)
+	if err != nil {
+		return cosigner.AuthState{}, "", err
+	}
+
+	stored := s.AuthStateMap[authID]
+	stored.AuthcodeRedeemed = true
+	stored.CosSignature = nil
+	authState.AuthcodeRedeemed = true
+	return authState, authID, nil
+}
+
+// checkRedeemableAuthcodeLocked verifies that an authcode has been issued and
+// has not yet been consumed without mutating any state. The caller must hold
+// both AuthStateMapLock and AuthcodeMapLock.
+func (s *AuthStateInMemoryStore) checkRedeemableAuthcodeLocked(authcode string) (cosigner.AuthState, string, error) {
 	authID, authcodeFound := s.AuthCodeMap[authcode]
-	s.AuthcodeMapLock.RUnlock()
 	if !authcodeFound {
 		return cosigner.AuthState{}, "", fmt.Errorf("invalid authcode")
-	} else {
-		s.AuthStateMapLock.Lock()
-		defer s.AuthStateMapLock.Unlock()
-
-		authState := s.AuthStateMap[authID]
-		if !authState.AuthcodeIssued {
-			// This should never happen
-			return cosigner.AuthState{}, "", fmt.Errorf("no authcode issued for this authID")
-		}
-		if authState.AuthcodeRedeemed {
-			return cosigner.AuthState{}, "", fmt.Errorf("authcode has already been redeemed")
-		}
-		authState.AuthcodeRedeemed = true
-		return *authState, authID, nil
 	}
+
+	authState := s.AuthStateMap[authID]
+	if authState == nil {
+		// This should never happen
+		return cosigner.AuthState{}, "", fmt.Errorf("no auth session for this authcode")
+	}
+	if !authState.AuthcodeIssued {
+		// This should never happen
+		return cosigner.AuthState{}, "", fmt.Errorf("no authcode issued for this authID")
+	}
+	if authState.AuthcodeRedeemed {
+		return cosigner.AuthState{}, "", fmt.Errorf("authcode has already been redeemed")
+	}
+
+	return cloneAuthState(authState), authID, nil
 }
