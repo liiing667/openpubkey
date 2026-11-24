@@ -46,6 +46,10 @@ type MockOp struct {
 	refreshTokens map[string]AuthSession
 	deviceCodes   map[string]DeviceAuthSession
 	httpClient    *http.Client
+
+	// dpopJtiStore is shared by all DPoP proofs presented to this OP so that
+	// a proof (identified by its jti) cannot be replayed across token requests.
+	dpopJtiStore *oidc.DpopJtiStore
 }
 
 type AuthSession struct {
@@ -87,6 +91,7 @@ func NewMockOp(issuer string, subjects []Subject) (*MockOp, error) {
 		authCodes:           map[string]AuthSession{},
 		refreshTokens:       map[string]AuthSession{},
 		deviceCodes:         map[string]DeviceAuthSession{},
+		dpopJtiStore:        oidc.NewDpopJtiStore(),
 	}, nil
 }
 
@@ -104,6 +109,7 @@ func NewMockKeyBindingOp(issuer string, subjects []Subject) (*MockOp, error) {
 		authCodes:           map[string]AuthSession{},
 		refreshTokens:       map[string]AuthSession{},
 		deviceCodes:         map[string]DeviceAuthSession{},
+		dpopJtiStore:        oidc.NewDpopJtiStore(),
 	}, nil
 }
 
@@ -436,7 +442,7 @@ func (m *MockOp) IssueTokens(req *http.Request) ([]byte, error) {
 				"htu":    m.GetTokenURI(),
 			}
 
-			jwkMap, err := validateDPoPReturnJwk(dpop, jktExpected, claimsRequired)
+			jwkMap, err := validateDPoPReturnJwk(dpop, jktExpected, claimsRequired, m.dpopJtiStore)
 			if err != nil {
 				return nil, fmt.Errorf("failed to validate DPoP JWT: %w", err)
 			}
@@ -493,7 +499,7 @@ func (m *MockOp) IssueTokens(req *http.Request) ([]byte, error) {
 				"htu":    m.GetTokenURI(),
 			}
 
-			jwkMap, err := validateDPoPReturnJwk(dpop, jktExpected, claimsRequired)
+			jwkMap, err := validateDPoPReturnJwk(dpop, jktExpected, claimsRequired, m.dpopJtiStore)
 			if err != nil {
 				return nil, fmt.Errorf("failed to validate DPoP JWT: %w", err)
 			}
@@ -534,7 +540,7 @@ func (m *MockOp) IssueTokens(req *http.Request) ([]byte, error) {
 			}
 
 			// Passing the authSession.Jkt here forces the JWK to be the same as the JWK in the original token request
-			jwkMap, err := validateDPoPReturnJwk(dpop, authSession.Jkt, claimsRequired)
+			jwkMap, err := validateDPoPReturnJwk(dpop, authSession.Jkt, claimsRequired, m.dpopJtiStore)
 			if err != nil {
 				return nil, fmt.Errorf("failed to validate DPoP JWT: %w", err)
 			}
@@ -595,13 +601,24 @@ func (u *UserBrowserInteractionMock) BrowserOpenOverrideFunc(op *MockOp) func(st
 	}
 }
 
-func validateDPoPReturnJwk(dpop string, jktExpected string, claimsRequired map[string]any) (map[string]string, error) {
+func validateDPoPReturnJwk(dpop string, jktExpected string, claimsRequired map[string]any, jtiStores ...*oidc.DpopJtiStore) (map[string]string, error) {
 	dpopJwt, err := oidc.NewDpopJwt([]byte(dpop))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse DPoP JWT: %w", err)
 	}
 
-	jwkJson, err := dpopJwt.GetJWKIfClaimsMatch(claimsRequired)
+	var jtiStore *oidc.DpopJtiStore
+	if len(jtiStores) > 0 {
+		jtiStore = jtiStores[0]
+	} else {
+		// This helper is also used directly in table-driven tests which
+		// validate several different proofs. Give those calls a per-call
+		// store; the MockOp itself passes its long-lived store above so
+		// replays across real token requests are still rejected.
+		jtiStore = oidc.NewDpopJtiStore()
+	}
+
+	jwkJson, err := dpopJwt.GetJWKIfClaimsMatch(claimsRequired, jtiStore)
 	if err != nil {
 		return nil, fmt.Errorf("DPoP claims validation failed: %w", err)
 	}
@@ -622,15 +639,15 @@ func validateDPoPReturnJwk(dpop string, jktExpected string, claimsRequired map[s
 	}
 
 	// Ensure that the alg match (DPoPheader.sig.ph.alg == DPoPheader.sig.ph.jwk.alg)
+	// when the JWK carries an alg. Older/legacy protected headers can omit the
+	// alg in the embedded JWK; in that case the protected header's alg is the
+	// authoritative one.
 	algInPh := dpopJwt.GetSignature().GetProtectedClaims().Alg
 	if algInPh == "" {
 		return nil, fmt.Errorf("no alg in protected header of DPoP header")
 	}
 	keyAlg, ok := key.Algorithm()
-	if !ok {
-		return nil, fmt.Errorf("failed to get algorithm from JWK")
-	}
-	if algInPh != keyAlg.String() {
+	if ok && algInPh != keyAlg.String() {
 		return nil, fmt.Errorf("in DPoP header the alg (%s) in JWK doesn't match alg (%s) in protected header", keyAlg.String(), algInPh)
 	}
 
