@@ -365,7 +365,7 @@ func (v *DefaultProviderVerifier) verifyGQSig(ctx context.Context, idt *oidc.Jwt
 	if idt.GetClaims().Issuer == "" {
 		return fmt.Errorf("missing issuer in payload: %s", idt.GetPayload())
 	}
-	if idt.GetClaims().Issuer != v.issuer {
+	if !oidc.SameIssuer(idt.GetClaims().Issuer, v.issuer) {
 		return fmt.Errorf("issuer of ID Token (%s) doesn't match expected issuer (%s)", idt.GetClaims().Issuer, v.issuer)
 	}
 

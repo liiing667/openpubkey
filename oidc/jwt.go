@@ -95,8 +95,10 @@ func SameIdentity(t1, t2 []byte) error {
 		return err
 	}
 
-	// Subject identity can only be established within the same issuer
-	if token1.GetClaims().Issuer != token2.GetClaims().Issuer {
+	// Subject identity can only be established within the same issuer. Accept
+	// the spelling aliases providers use for one issuer (for example Google
+	// emits both "accounts.google.com" and "https://accounts.google.com").
+	if !SameIssuer(token1.GetClaims().Issuer, token2.GetClaims().Issuer) {
 		return fmt.Errorf("tokens have different issuers")
 	}
 

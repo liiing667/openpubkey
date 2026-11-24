@@ -43,13 +43,25 @@ type OidcClaims struct {
 
 // Implement UnmarshalJSON for custom handling during JSON unmarshalling
 func (id *OidcClaims) UnmarshalJSON(data []byte) error {
+	// JSON unmarshalling into an existing struct leaves fields that are absent
+	// from the new document untouched. Claims are frequently reused between
+	// authentication attempts (for example when a caller retries with another
+	// provider), so clear the previous identity first. Otherwise a retry that
+	// omits a claim could inherit the previous user's issuer, subject, email,
+	// etc.
+	*id = OidcClaims{}
+
+	// Decode into a temporary value so a malformed response does not leave a
+	// partially populated set of the new claims behind either.
+	var decoded OidcClaims
+
 	// unmarshal audience claim separately to account for []string, https://datatracker.ietf.org/doc/html/rfc7519#section-4.1.3
 	type Alias OidcClaims
 	aux := &struct {
 		Audience any `json:"aud"`
 		*Alias
 	}{
-		Alias: (*Alias)(id),
+		Alias: (*Alias)(&decoded),
 	}
 
 	if err := json.Unmarshal(data, &aux); err != nil {
@@ -66,7 +78,7 @@ func (id *OidcClaims) UnmarshalJSON(data []byte) error {
 	// https://datatracker.ietf.org/doc/html/rfc7519#section-4.1.3
 	switch t := aux.Audience.(type) {
 	case string:
-		id.Audience = t
+		decoded.Audience = t
 	case []any:
 		audList := []string{}
 		for _, v := range t {
@@ -77,13 +89,14 @@ func (id *OidcClaims) UnmarshalJSON(data []byte) error {
 			}
 		}
 		// TODO: Change audience to []string
-		id.Audience = strings.Join(audList, ",")
+		decoded.Audience = strings.Join(audList, ",")
 	case nil:
-		id.Audience = ""
+		decoded.Audience = ""
 	default:
 		return fmt.Errorf("invalid audience type, got %T", t)
 	}
 
+	*id = decoded
 	return nil
 }
 

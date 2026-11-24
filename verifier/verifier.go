@@ -20,11 +20,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/lestrrat-go/jwx/v3/jwk"
 	"github.com/lestrrat-go/jwx/v3/jws"
 	"github.com/openpubkey/openpubkey/internal/jwx"
 	"github.com/openpubkey/openpubkey/jose"
+	simpleoidc "github.com/openpubkey/openpubkey/oidc"
 	"github.com/openpubkey/openpubkey/pktoken"
 	"github.com/openpubkey/openpubkey/pktoken/clientinstance"
 )
@@ -163,7 +165,7 @@ func (v *Verifier) VerifyPKToken(
 		return err
 	}
 
-	providerVerifiers, ok := v.providers[issuer]
+	providerVerifiers, ok := v.verifiersForIssuer(issuer)
 	if !ok {
 		var knownIssuers []string
 		for k := range v.providers {
@@ -265,6 +267,33 @@ func (v *Verifier) VerifyPKToken(
 	}
 
 	return nil
+}
+
+// verifiersForIssuer returns every verifier registered for the PK Token's
+// issuer. Besides exact matches, it accepts harmless spelling aliases of the
+// same issuer (for example Google emits both "accounts.google.com" and
+// "https://accounts.google.com"). All matching verifiers are returned so that
+// a provider may still register several verifiers under one issuer.
+func (v *Verifier) verifiersForIssuer(issuer string) ([]ProviderVerifier, bool) {
+	matches := append([]ProviderVerifier(nil), v.providers[issuer]...)
+
+	// Iterate aliases in a stable order so registration order within each
+	// issuer is preserved and the result does not depend on map iteration.
+	var aliases []string
+	for registeredIssuer := range v.providers {
+		if registeredIssuer != issuer && simpleoidc.SameIssuer(registeredIssuer, issuer) {
+			aliases = append(aliases, registeredIssuer)
+		}
+	}
+	sort.Strings(aliases)
+	for _, alias := range aliases {
+		matches = append(matches, v.providers[alias]...)
+	}
+
+	if len(matches) == 0 {
+		return nil, false
+	}
+	return matches, true
 }
 
 func verifyCicSignature(pkt *pktoken.PKToken) error {
