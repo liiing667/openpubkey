@@ -21,6 +21,7 @@ import (
 	"crypto"
 	"fmt"
 	"net/http"
+	"sync"
 
 	"github.com/lestrrat-go/jwx/v3/jwk"
 
@@ -45,10 +46,21 @@ type OpkClient struct {
 	cosP         *CosignerProvider
 	signer       crypto.Signer
 	alg          jose.KeyAlgorithm
+	printPKToken bool // printPKToken is default false, used to debug PK Token contents
+
+	// mu guards the session state below (pkToken, refreshToken,
+	// accessToken, generation). Refresh holds it for the entire
+	// refresh-verify-commit sequence so that two refreshes completing at
+	// the same time cannot overwrite each other and a failed refresh never
+	// leaves a half-updated session behind.
+	mu           sync.Mutex
 	pkToken      *pktoken.PKToken
 	refreshToken []byte
 	accessToken  []byte
-	printPKToken bool // printPKToken is default false, used to debug PK Token contents
+	// generation counts the successful refreshes of the current session.
+	// It is committed atomically together with the fresh ID Token and the
+	// (possibly rotated) refresh token.
+	generation uint64
 }
 
 // ClientOpts contains options for constructing an OpkClient
@@ -156,8 +168,7 @@ func (o *OpkClient) Auth(ctx context.Context, opts ...AuthOpts) (*pktoken.PKToke
 		if err != nil {
 			return nil, err
 		}
-		o.pkToken = pkt
-		return o.pkToken.DeepCopy()
+		return pkt.DeepCopy()
 	}
 
 	// If a Cosigner is set then check that will support doing Cosigner auth
@@ -179,8 +190,10 @@ func (o *OpkClient) Auth(ctx context.Context, opts ...AuthOpts) (*pktoken.PKToke
 		if err != nil {
 			return nil, err
 		}
+		o.mu.Lock()
 		o.pkToken = pktCos
-		return o.pkToken.DeepCopy()
+		o.mu.Unlock()
+		return pktCos.DeepCopy()
 	}
 }
 
@@ -223,8 +236,6 @@ func (o *OpkClient) oidcAuth(
 		return nil, fmt.Errorf("error requesting OIDC tokens from OpenID Provider: %w", err)
 	}
 	idToken := tokens.IDToken
-	o.refreshToken = tokens.RefreshToken
-	o.accessToken = tokens.AccessToken
 
 	// Sign over the payload from the ID token and client instance claims
 	cicToken, err := cic.Sign(signer, alg, idToken)
@@ -254,31 +265,84 @@ func (o *OpkClient) oidcAuth(
 	if err := pktVerifier.VerifyPKToken(ctx, pkt, verifierChecks...); err != nil {
 		return nil, fmt.Errorf("error verifying PK Token: %w", err)
 	}
+
+	// Commit the new session state in one shot only after the PK Token has
+	// been verified, so a failed Auth never leaves a half-initialized
+	// session behind.
+	o.mu.Lock()
+	o.pkToken = pkt
+	o.refreshToken = tokens.RefreshToken
+	o.accessToken = tokens.AccessToken
+	o.generation = 0
+	o.mu.Unlock()
+
 	return pkt, nil
 }
 
 // Refresh uses a Refresh Token to request a fresh ID Token and Access Token from an OpenID Provider.
 // It provides a way to refresh the Access and ID Tokens for an OpenID Provider that supports refresh requests,
 // allowing the client to continue making authenticated requests without requiring the user to re-authenticate.
+//
+// The refreshed ID Token is verified against the ID Token the PK Token was
+// created from (same subject, same key binding, valid OP signature) before
+// any client state is touched. The fresh ID Token, the refresh token and the
+// session generation are then committed in one shot. If the refresh request
+// or the verification fails, the client keeps its previous state untouched,
+// so the caller can keep using the previous fresh ID Token and retry the
+// refresh later. Refresh is safe for concurrent use: concurrent calls are
+// serialized and cannot overwrite each other's committed state.
 func (o *OpkClient) Refresh(ctx context.Context) (*pktoken.PKToken, error) {
-	if tokensOp, ok := o.Op.(providers.RefreshableOpenIdProvider); ok {
-		if !o.HasRefreshToken() {
-			return nil, fmt.Errorf("no refresh token set")
-		}
-		if o.pkToken == nil {
-			return nil, fmt.Errorf("no PK Token set, run Auth() to create a PK Token first")
-		}
-		tokens, err := tokensOp.RefreshTokens(ctx, o.refreshToken)
-		if err != nil {
-			return nil, fmt.Errorf("error requesting ID token: %w", err)
-		}
-		o.pkToken.FreshIDToken = tokens.IDToken
-		o.refreshToken = tokens.RefreshToken
-		o.accessToken = tokens.AccessToken
-
-		return o.pkToken.DeepCopy()
+	tokensOp, ok := o.Op.(providers.RefreshableOpenIdProvider)
+	if !ok {
+		return nil, fmt.Errorf("OP (issuer=%s) does not support OIDC refresh requests", o.Op.Issuer())
 	}
-	return nil, fmt.Errorf("OP (issuer=%s) does not support OIDC refresh requests", o.Op.Issuer())
+
+	// Hold the lock for the whole refresh-verify-commit sequence. This
+	// serializes concurrent refreshes so they cannot overwrite each other's
+	// tokens, and makes the state commit below atomic.
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if len(o.refreshToken) == 0 {
+		return nil, fmt.Errorf("no refresh token set")
+	}
+	if o.pkToken == nil {
+		return nil, fmt.Errorf("no PK Token set, run Auth() to create a PK Token first")
+	}
+
+	tokens, err := tokensOp.RefreshTokens(ctx, o.refreshToken)
+	if err != nil {
+		return nil, fmt.Errorf("error requesting ID token: %w", err)
+	}
+	if tokens == nil || len(tokens.IDToken) == 0 {
+		return nil, fmt.Errorf("OP (issuer=%s) returned no ID Token on refresh", o.Op.Issuer())
+	}
+
+	// Verify the refreshed ID Token before committing any state: it must be
+	// issued for the same subject and carry the same key binding as the ID
+	// Token this session was established with. If verification fails the
+	// previous session state, including the previous fresh ID Token, is
+	// kept untouched.
+	if err := tokensOp.VerifyRefreshedIDToken(ctx, o.pkToken.OpToken, tokens.IDToken); err != nil {
+		return nil, fmt.Errorf("error verifying refreshed ID Token: %w", err)
+	}
+
+	// Commit the fresh ID Token, the refresh token and the new generation
+	// in one shot so a failed refresh can never leave a half-updated
+	// session behind.
+	o.pkToken.FreshIDToken = tokens.IDToken
+	if len(tokens.RefreshToken) > 0 {
+		// Some OPs (e.g. Google) do not rotate refresh tokens and may not
+		// return one on refresh; in that case keep the refresh token the
+		// client already holds.
+		o.refreshToken = tokens.RefreshToken
+	}
+	if len(tokens.AccessToken) > 0 {
+		o.accessToken = tokens.AccessToken
+	}
+	o.generation++
+
+	return o.pkToken.DeepCopy()
 }
 
 // GetOp returns the OpenID Provider the OpkClient has been configured to use
@@ -304,19 +368,35 @@ func (o *OpkClient) GetAlg() jose.KeyAlgorithm {
 }
 
 func (o *OpkClient) GetAccessToken() []byte {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	return o.accessToken
 }
 
 // HasRefreshToken reports if the OP issued a refresh token during Auth.
 func (o *OpkClient) HasRefreshToken() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	return len(o.refreshToken) > 0
 }
 
+// GetGeneration returns the number of successful refreshes of the current
+// session. It is reset to zero every time Auth establishes a new session.
+func (o *OpkClient) GetGeneration() uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.generation
+}
+
 func (o *OpkClient) SetPKToken(pkt *pktoken.PKToken) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	o.pkToken = pkt
 }
 
 // GetPKToken returns a deep copy of client's current PK Token
 func (o *OpkClient) GetPKToken() (*pktoken.PKToken, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	return o.pkToken.DeepCopy()
 }

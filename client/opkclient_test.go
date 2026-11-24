@@ -19,6 +19,8 @@ package client_test
 import (
 	"context"
 	"crypto/rsa"
+	"errors"
+	"sync"
 	"testing"
 
 	"github.com/openpubkey/openpubkey/client"
@@ -260,6 +262,215 @@ func TestClientRefreshNotSupported(t *testing.T) {
 
 	_, err = c.Refresh(context.Background())
 	require.ErrorContains(t, err, "does not support OIDC refresh requests")
+}
+
+// errRefreshOp wraps a MockProvider and fails refresh requests while err is set.
+type errRefreshOp struct {
+	*providers.MockProvider
+	err error
+}
+
+func (e *errRefreshOp) RefreshTokens(ctx context.Context, refreshToken []byte) (*oidc.Tokens, error) {
+	if e.err != nil {
+		return nil, e.err
+	}
+	return e.MockProvider.RefreshTokens(ctx, refreshToken)
+}
+
+func TestClientRefreshFailurePreservesState(t *testing.T) {
+	signerAlg := jose.ES256
+
+	providerOpts := providers.DefaultMockProviderOpts()
+	op, _, _, err := providers.NewMockProvider(providerOpts)
+	require.NoError(t, err)
+	failOp := &errRefreshOp{MockProvider: op}
+
+	signer, err := util.GenKeyPair(signerAlg)
+	require.NoError(t, err)
+	c, err := client.New(failOp, client.WithSigner(signer, signerAlg))
+	require.NoError(t, err)
+
+	_, err = c.Auth(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), c.GetGeneration())
+
+	// A successful refresh to establish a fresh ID Token
+	pkt2, err := c.Refresh(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, pkt2.FreshIDToken)
+	require.Equal(t, uint64(1), c.GetGeneration())
+
+	// When the refresh fails the client must keep its previous state:
+	// the caller keeps the previous fresh ID Token and can continue to use
+	// it as their session.
+	failOp.err = errors.New("OP unreachable")
+	_, err = c.Refresh(context.Background())
+	require.ErrorContains(t, err, "OP unreachable")
+
+	pktAfter, err := c.GetPKToken()
+	require.NoError(t, err)
+	require.Equal(t, pkt2.FreshIDToken, pktAfter.FreshIDToken,
+		"failed refresh must not clear or overwrite the previous fresh ID Token")
+	require.Equal(t, uint64(1), c.GetGeneration(),
+		"failed refresh must not bump the session generation")
+	require.True(t, c.HasRefreshToken(),
+		"failed refresh must not drop the refresh token")
+
+	// Once the OP is reachable again the same session can be refreshed
+	failOp.err = nil
+	pkt3, err := c.Refresh(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, pkt3.FreshIDToken)
+	require.Equal(t, uint64(2), c.GetGeneration())
+}
+
+// wrongSubjectRefreshOp wraps a MockProvider and returns a refreshed ID Token
+// issued for a different subject than the original ID Token.
+type wrongSubjectRefreshOp struct {
+	*providers.MockProvider
+	template *mocks.IDTokenTemplate
+}
+
+func (w *wrongSubjectRefreshOp) RefreshTokens(_ context.Context, _ []byte) (*oidc.Tokens, error) {
+	return w.template.IssueTokensWithSubject(&mocks.Subject{SubjectID: "mallory"})
+}
+
+func TestClientRefreshVerifiesSubjectBeforeCommit(t *testing.T) {
+	signerAlg := jose.ES256
+
+	providerOpts := providers.DefaultMockProviderOpts()
+	op, _, idtTemplate, err := providers.NewMockProvider(providerOpts)
+	require.NoError(t, err)
+	evilOp := &wrongSubjectRefreshOp{MockProvider: op, template: idtTemplate}
+
+	signer, err := util.GenKeyPair(signerAlg)
+	require.NoError(t, err)
+	c, err := client.New(evilOp, client.WithSigner(signer, signerAlg))
+	require.NoError(t, err)
+
+	pkt1, err := c.Auth(context.Background())
+	require.NoError(t, err)
+	require.Nil(t, pkt1.FreshIDToken)
+
+	// The refreshed ID Token is for a different subject; the client must
+	// reject it and keep its previous state untouched.
+	_, err = c.Refresh(context.Background())
+	require.ErrorContains(t, err, "error verifying refreshed ID Token")
+
+	pktAfter, err := c.GetPKToken()
+	require.NoError(t, err)
+	require.Nil(t, pktAfter.FreshIDToken,
+		"rejected refreshed ID Token must not be committed")
+	require.Equal(t, uint64(0), c.GetGeneration())
+	require.True(t, c.HasRefreshToken())
+}
+
+// nonRotatingRefreshOp wraps a MockProvider and does not return a refresh
+// token on refresh, like OPs (e.g. Google) that do not rotate refresh tokens.
+type nonRotatingRefreshOp struct {
+	*providers.MockProvider
+}
+
+func (n *nonRotatingRefreshOp) RefreshTokens(ctx context.Context, refreshToken []byte) (*oidc.Tokens, error) {
+	tokens, err := n.MockProvider.RefreshTokens(ctx, refreshToken)
+	if err != nil {
+		return nil, err
+	}
+	return &oidc.Tokens{
+		IDToken:     tokens.IDToken,
+		AccessToken: tokens.AccessToken,
+	}, nil
+}
+
+func TestClientRefreshKeepsRefreshTokenWhenNotRotated(t *testing.T) {
+	signerAlg := jose.ES256
+
+	providerOpts := providers.DefaultMockProviderOpts()
+	op, _, _, err := providers.NewMockProvider(providerOpts)
+	require.NoError(t, err)
+	nonRotatingOp := &nonRotatingRefreshOp{MockProvider: op}
+
+	signer, err := util.GenKeyPair(signerAlg)
+	require.NoError(t, err)
+	c, err := client.New(nonRotatingOp, client.WithSigner(signer, signerAlg))
+	require.NoError(t, err)
+
+	_, err = c.Auth(context.Background())
+	require.NoError(t, err)
+	require.True(t, c.HasRefreshToken())
+
+	// Both refreshes must succeed even though the OP never returns a new
+	// refresh token: the client keeps using the one it already holds.
+	for i := uint64(1); i <= 2; i++ {
+		pkt, err := c.Refresh(context.Background())
+		require.NoError(t, err)
+		require.NotNil(t, pkt.FreshIDToken)
+		require.Equal(t, i, c.GetGeneration())
+		require.True(t, c.HasRefreshToken(),
+			"client must keep its refresh token when the OP does not rotate it")
+	}
+}
+
+// serializedRefreshOp wraps a MockProvider and serializes RefreshTokens so
+// the mock backend (which is not concurrency-safe) is not raced; the test
+// exercises the client's own concurrency handling.
+type serializedRefreshOp struct {
+	*providers.MockProvider
+	mu sync.Mutex
+}
+
+func (s *serializedRefreshOp) RefreshTokens(ctx context.Context, refreshToken []byte) (*oidc.Tokens, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.MockProvider.RefreshTokens(ctx, refreshToken)
+}
+
+func TestClientRefreshConcurrent(t *testing.T) {
+	signerAlg := jose.ES256
+
+	providerOpts := providers.DefaultMockProviderOpts()
+	op, _, _, err := providers.NewMockProvider(providerOpts)
+	require.NoError(t, err)
+	serializedOp := &serializedRefreshOp{MockProvider: op}
+
+	signer, err := util.GenKeyPair(signerAlg)
+	require.NoError(t, err)
+	c, err := client.New(serializedOp, client.WithSigner(signer, signerAlg))
+	require.NoError(t, err)
+
+	_, err = c.Auth(context.Background())
+	require.NoError(t, err)
+
+	const numRefreshes = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, numRefreshes)
+	for range numRefreshes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pkt, err := c.Refresh(context.Background())
+			if err != nil {
+				errs <- err
+				return
+			}
+			if pkt.FreshIDToken == nil {
+				errs <- errors.New("refreshed PK Token missing fresh ID Token")
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	// Every concurrent refresh must have committed exactly once; none may
+	// have overwritten another one's commit.
+	require.Equal(t, uint64(numRefreshes), c.GetGeneration())
+	pkt, err := c.GetPKToken()
+	require.NoError(t, err)
+	require.NotNil(t, pkt.FreshIDToken)
+	require.True(t, c.HasRefreshToken())
 }
 
 func TestKeybinding(t *testing.T) {
