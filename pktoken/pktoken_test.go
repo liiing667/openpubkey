@@ -405,3 +405,328 @@ func BuildToken(protected string, payload string, sig string) []byte {
 		util.Base64EncodeForJWT([]byte(payload)),
 		util.Base64EncodeForJWT([]byte(sig)))
 }
+
+// compactToJSON round-trips a compact PK Token through the JSON entry point.
+// It is used to assert that both entry points interpret the same bytes
+// identically.
+func compactToJSON(t *testing.T, pktCom []byte) []byte {
+	pktFromCom, err := pktoken.NewFromCompact(pktCom)
+	require.NoError(t, err)
+	pktJSON, err := json.Marshal(pktFromCom)
+	require.NoError(t, err)
+	return pktJSON
+}
+
+// TestEntryPointEquivalence verifies that feeding the very same compact PK
+// Token bytes through both entry points (NewFromCompact and UnmarshalJSON)
+// produces equivalent PK Tokens. This is the core matrix the bug report
+// describes: signature type classification, payload ownership and the
+// re-encoding of the signed segments must not depend on the entry point.
+func TestEntryPointEquivalence(t *testing.T) {
+	alg := jose.ES256
+	signingKey, err := util.GenKeyPair(alg)
+	require.NoError(t, err)
+
+	pkt, err := mocks.GenerateMockPKToken(t, signingKey, alg)
+	require.NoError(t, err)
+
+	// Include a fresh ID Token so that the fresh appended segment is covered
+	// by the equivalence check as well.
+	freshIDToken := BuildToken(`{"alg":"RS256","typ":"JWT"}`,
+		`{"iss":"mockIssuer","sub":"1234567890","exp":1900000000}`, "fake fresh sig")
+	pkt.FreshIDToken = freshIDToken
+
+	pktCom, err := pkt.Compact()
+	require.NoError(t, err)
+
+	// Entry point 1: compact
+	pktFromCom, err := pktoken.NewFromCompact(pktCom)
+	require.NoError(t, err)
+
+	// Entry point 2: JSON (marshal the compact-parsed token, then parse the JSON)
+	pktJSON, err := json.Marshal(pktFromCom)
+	require.NoError(t, err)
+	var pktFromJSON pktoken.PKToken
+	require.NoError(t, json.Unmarshal(pktJSON, &pktFromJSON))
+
+	// The re-encoded signed segments must be byte identical regardless of the
+	// entry point; any change breaks signature verification.
+	require.Equal(t, pktFromCom.OpToken, pktFromJSON.OpToken)
+	require.Equal(t, pktFromCom.CicToken, pktFromJSON.CicToken)
+	require.Equal(t, pktFromCom.CosToken, pktFromJSON.CosToken)
+	require.Equal(t, pktFromCom.Payload, pktFromJSON.Payload)
+
+	// And the round trip back to compact must be stable.
+	pktComAgain, err := pktFromJSON.Compact()
+	require.NoError(t, err)
+	require.Equal(t, pktCom, pktComAgain)
+
+	// The fresh ID Token is owned separately and must survive both paths.
+	require.Equal(t, freshIDToken, pktFromCom.FreshIDToken)
+
+	// Re-marshalling the JSON-parsed token must reproduce the same JSON.
+	pktJSONAgain, err := json.Marshal(&pktFromJSON)
+	require.NoError(t, err)
+	require.JSONEq(t, string(pktJSON), string(pktJSONAgain))
+}
+
+// TestDuplicateSegmentsRejected ensures that repeated CIC/OIDC/COS segments
+// are rejected by the compact entry point just like the JSON entry point,
+// instead of silently overwriting an earlier signature of the same type.
+func TestDuplicateSegmentsRejected(t *testing.T) {
+	payload := `{"iss":"mockIssuer","sub":"1234567890","nonce":"abc","exp":1900000000}`
+
+	opToken := BuildToken(`{"alg":"RS256","typ":"JWT"}`, payload, "op sig")
+	cicToken1 := BuildToken(`{"alg":"ES256","typ":"CIC","upk":{}}`, payload, "cic sig 1")
+	cicToken2 := BuildToken(`{"alg":"ES256","typ":"CIC","upk":{}}`, payload, "cic sig 2")
+
+	// Compact representation with two CIC segments (same payload, duplicated
+	// protected/signature pairs).
+	com, err := pktoken.CompactPKToken([][]byte{opToken, cicToken1, cicToken2}, nil)
+	require.NoError(t, err)
+
+	var pkt *pktoken.PKToken
+	pkt, err = pktoken.NewFromCompact(com)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "only one signature of type \"cic\" is allowed")
+	require.Nil(t, pkt, "a failed parse must not return a half-populated PK Token")
+}
+
+// TestNewFromCompactAtomicOnFailure checks that no failure mode of
+// NewFromCompact leaks a partially populated PK Token and that malformed
+// compact inputs are rejected before any state is committed.
+func TestNewFromCompactAtomicOnFailure(t *testing.T) {
+	payload := `{"iss":"mockIssuer","sub":"1234567890","nonce":"abc","exp":1900000000}`
+
+	t.Run("unrecognized signature type", func(t *testing.T) {
+		opToken := BuildToken(`{"alg":"RS256","typ":"JWT"}`, payload, "op sig")
+		bogusToken := BuildToken(`{"alg":"ES256","typ":"NOPE"}`, payload, "bogus sig")
+		com, err := pktoken.CompactPKToken([][]byte{opToken, bogusToken}, nil)
+		require.NoError(t, err)
+
+		pkt, err := pktoken.NewFromCompact(com)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "unrecognized signature type")
+		require.Nil(t, pkt)
+	})
+
+	t.Run("missing CIC segment", func(t *testing.T) {
+		opToken := BuildToken(`{"alg":"RS256","typ":"JWT"}`, payload, "op sig")
+		com, err := pktoken.CompactPKToken([][]byte{opToken}, nil)
+		require.NoError(t, err)
+
+		pkt, err := pktoken.NewFromCompact(com)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "at least one signature of type \"cic\" is required")
+		require.Nil(t, pkt)
+	})
+
+	t.Run("payload mismatch is rejected and leaves no half object", func(t *testing.T) {
+		opToken := BuildToken(`{"alg":"RS256","typ":"JWT"}`, payload, "op sig")
+		otherPayload := `{"iss":"mockIssuer","sub":"999","nonce":"abc","exp":1900000000}`
+		cicToken := BuildToken(`{"alg":"ES256","typ":"CIC","upk":{}}`, otherPayload, "cic sig")
+
+		// CompactPKToken owns payload equality up front: every signed segment
+		// must share the same payload or serialization is refused.
+		_, err := pktoken.CompactPKToken([][]byte{opToken, cicToken}, nil)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "payloads in tokens are not the same")
+	})
+
+	t.Run("invalid refreshed ID Token", func(t *testing.T) {
+		opToken := BuildToken(`{"alg":"RS256","typ":"JWT"}`, payload, "op sig")
+		cicToken := BuildToken(`{"alg":"ES256","typ":"CIC","upk":{}}`, payload, "cic sig")
+		com, err := pktoken.CompactPKToken([][]byte{opToken, cicToken}, nil)
+		require.NoError(t, err)
+
+		// Hand-craft a compact PK Token whose appended fresh segment is not a
+		// three-part JWT and confirm the parse entry point rejects it without
+		// returning a PK Token.
+		badCompact := append(append([]byte{}, com...), []byte(".NOT.A.VALID.JWT")...)
+		pkt, err := pktoken.NewFromCompact(badCompact)
+		require.Error(t, err)
+		require.ErrorContains(t, err, "invalid refreshed ID Token")
+		require.Nil(t, pkt)
+	})
+}
+
+// TestUnmarshalJSONAtomicOnFailure verifies the JSON entry point never leaves
+// a half-populated PK Token behind when parsing fails.
+func TestUnmarshalJSONAtomicOnFailure(t *testing.T) {
+	alg := jose.ES256
+	signingKey, err := util.GenKeyPair(alg)
+	require.NoError(t, err)
+
+	pkt, err := mocks.GenerateMockPKToken(t, signingKey, alg)
+	require.NoError(t, err)
+
+	goodJSON, err := json.Marshal(pkt)
+	require.NoError(t, err)
+
+	// Corrupt the JSON so that a signature carries an unknown typ.
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(goodJSON, &raw))
+	sigs := raw["signatures"].([]any)
+	for _, s := range sigs {
+		sigMap := s.(map[string]any)
+		protectedB64 := sigMap["protected"].(string)
+		protectedJSON, err := util.Base64DecodeForJWT([]byte(protectedB64))
+		require.NoError(t, err)
+		var headers map[string]any
+		require.NoError(t, json.Unmarshal(protectedJSON, &headers))
+		if _, ok := headers["typ"]; ok {
+			headers["typ"] = "UNSUPPORTED-TYP"
+			newProtected, err := json.Marshal(headers)
+			require.NoError(t, err)
+			sigMap["protected"] = string(util.Base64EncodeForJWT(newProtected))
+		}
+	}
+	badJSON, err := json.Marshal(raw)
+	require.NoError(t, err)
+
+	// Seed a valid token first, then attempt to overwrite it with bad data.
+	var target pktoken.PKToken
+	require.NoError(t, json.Unmarshal(goodJSON, &target))
+	require.NotNil(t, target.OpToken)
+
+	err = json.Unmarshal(badJSON, &target)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "unrecognized signature type")
+
+	// The previously valid state must be preserved: a failed unmarshal must
+	// not mutate the target into a half object.
+	require.NotNil(t, target.OpToken)
+	require.NotNil(t, target.CicToken)
+}
+
+// TestMissingTypTreatedAsOIDCCompact confirms that old compact PK Tokens whose
+// OP signature omits the "typ" header (e.g. Okta) still parse and are
+// classified as OIDC through the compact entry point.
+func TestMissingTypTreatedAsOIDCCompact(t *testing.T) {
+	payload := `{"iss":"mockIssuer","sub":"1234567890","nonce":"abc","exp":1900000000}`
+
+	// OP token with no typ claim.
+	opToken := BuildToken(`{"alg":"RS256"}`, payload, "op sig")
+	cicToken := BuildToken(`{"alg":"ES256","typ":"CIC","upk":{}}`, payload, "cic sig")
+
+	com, err := pktoken.CompactPKToken([][]byte{opToken, cicToken}, nil)
+	require.NoError(t, err)
+
+	pkt, err := pktoken.NewFromCompact(com)
+	require.NoError(t, err)
+	require.NotNil(t, pkt.Op)
+	require.NotNil(t, pkt.OpToken)
+	require.NotNil(t, pkt.CicToken)
+	// The re-encoded OP token keeps the original typ-less protected header.
+	require.Equal(t, opToken, pkt.OpToken)
+}
+
+// TestAtJWTEntryPointEquivalence checks that an "at+jwt" (RFC 9068, in any
+// casing) OP signature is treated as OIDC by both entry points and that the
+// original protected header is preserved byte-for-byte during re-encoding.
+func TestAtJWTEntryPointEquivalence(t *testing.T) {
+	payload := `{"iss":"mockIssuer","sub":"1234567890","nonce":"abc","exp":1900000000}`
+
+	for _, typ := range []string{"at+jwt", "AT+JWT", "At+JwT"} {
+		t.Run(typ, func(t *testing.T) {
+			opToken := BuildToken(`{"alg":"RS256","typ":"`+typ+`"}`, payload, "op sig")
+			cicToken := BuildToken(`{"alg":"ES256","typ":"CIC","upk":{}}`, payload, "cic sig")
+
+			com, err := pktoken.CompactPKToken([][]byte{opToken, cicToken}, nil)
+			require.NoError(t, err)
+
+			pktFromCom, err := pktoken.NewFromCompact(com)
+			require.NoError(t, err)
+			require.NotNil(t, pktFromCom.OpToken)
+			// Re-encoding must preserve the exact original protected header.
+			require.Equal(t, opToken, pktFromCom.OpToken)
+
+			// Same bytes via the JSON entry point must classify identically.
+			pktJSON := compactToJSON(t, com)
+			var pktFromJSON pktoken.PKToken
+			require.NoError(t, json.Unmarshal(pktJSON, &pktFromJSON))
+			require.NotNil(t, pktFromJSON.OpToken)
+			require.Equal(t, pktFromCom.OpToken, pktFromJSON.OpToken)
+		})
+	}
+}
+
+// TestKeyBoundEntryPointEquivalence ensures the OIDCKB ("dpop+id_token")
+// signature type is routed to the OP slot through both entry points and that
+// re-encoding preserves the signed segments.
+func TestKeyBoundEntryPointEquivalence(t *testing.T) {
+	payload := `{"iss":"mockIssuer","sub":"1234567890","nonce":"abc","exp":1900000000}`
+
+	opToken := BuildToken(
+		`{"alg":"RS256","typ":"dpop+id_token","cnf":{"jwk":{"kty":"EC","crv":"P-256","x":"x","y":"y"}}}`,
+		payload, "op sig")
+	cicToken := BuildToken(`{"alg":"ES256","typ":"CIC","upk":{}}`, payload, "cic sig")
+
+	com, err := pktoken.CompactPKToken([][]byte{opToken, cicToken}, nil)
+	require.NoError(t, err)
+
+	// Compact entry point: key bound token lands in the OP slot.
+	pktFromCom, err := pktoken.NewFromCompact(com)
+	require.NoError(t, err)
+	require.NotNil(t, pktFromCom.Op)
+	require.Nil(t, pktFromCom.Cos)
+	require.Equal(t, opToken, pktFromCom.OpToken)
+	require.Equal(t, cicToken, pktFromCom.CicToken)
+
+	// JSON entry point on the equivalent general JWS must agree.
+	pktJSON := compactToJSON(t, com)
+	var pktFromJSON pktoken.PKToken
+	require.NoError(t, json.Unmarshal(pktJSON, &pktFromJSON))
+	require.NotNil(t, pktFromJSON.Op)
+	require.Equal(t, pktFromCom.OpToken, pktFromJSON.OpToken)
+	require.Equal(t, pktFromCom.CicToken, pktFromJSON.CicToken)
+}
+
+// TestDuplicateOIDCSegmentsRejected verifies that a compact PK Token carrying
+// two OIDC segments is rejected rather than having the second silently
+// overwrite the first.
+func TestDuplicateOIDCSegmentsRejected(t *testing.T) {
+	payload := `{"iss":"mockIssuer","sub":"1234567890","nonce":"abc","exp":1900000000}`
+
+	opToken1 := BuildToken(`{"alg":"RS256","typ":"JWT"}`, payload, "op sig 1")
+	opToken2 := BuildToken(`{"alg":"RS256","typ":"JWT","kid":"other"}`, payload, "op sig 2")
+	cicToken := BuildToken(`{"alg":"ES256","typ":"CIC","upk":{}}`, payload, "cic sig")
+
+	com, err := pktoken.CompactPKToken([][]byte{opToken1, opToken2, cicToken}, nil)
+	require.NoError(t, err)
+
+	pkt, err := pktoken.NewFromCompact(com)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "only one signature of type \"oidc\" or \"oidc_gq\" is allowed")
+	require.Nil(t, pkt)
+}
+
+// TestFreshIDTokenRoundTrip confirms the fresh (refreshed) ID Token segment is
+// appended on serialization and restored separately on parsing without ever
+// being mixed into the shared PK Token payload.
+func TestFreshIDTokenRoundTrip(t *testing.T) {
+	payload := `{"iss":"mockIssuer","sub":"1234567890","nonce":"abc","exp":1700000000}`
+
+	opToken := BuildToken(`{"alg":"RS256","typ":"JWT"}`, payload, "op sig")
+	cicToken := BuildToken(`{"alg":"ES256","typ":"CIC","upk":{}}`, payload, "cic sig")
+	// The fresh token intentionally carries a different payload.
+	freshToken := BuildToken(`{"alg":"RS256","typ":"JWT"}`,
+		`{"iss":"mockIssuer","sub":"1234567890","exp":1900000000}`, "fresh sig")
+
+	com, err := pktoken.CompactPKToken([][]byte{opToken, cicToken}, freshToken)
+	require.NoError(t, err)
+
+	pkt, err := pktoken.NewFromCompact(com)
+	require.NoError(t, err)
+	require.Equal(t, freshToken, pkt.FreshIDToken)
+
+	// Re-serializing must reproduce the exact compact bytes, fresh segment
+	// included, proving nothing was re-encoded or re-owned.
+	comAgain, err := pkt.Compact()
+	require.NoError(t, err)
+	require.Equal(t, com, comAgain)
+
+	// The main payload is untouched by the fresh token's distinct payload.
+	require.Equal(t, util.Base64EncodeForJWT([]byte(payload)),
+		util.Base64EncodeForJWT(pkt.Payload))
+}

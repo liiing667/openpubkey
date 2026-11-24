@@ -47,6 +47,57 @@ const (
 
 type Signature = jws.Signature
 
+// classifySignatureType maps the protected header "typ" claim of a JWS
+// signature to the PK Token signature type used internally by OpenPubKey.
+//
+// Both the JSON (general JWS) and compact entry points must classify
+// signatures using this single matrix so that the same token can never be
+// interpreted differently depending on which entry point parsed it:
+//   - A missing "typ" claim is treated as an OIDC signature. Some providers
+//     (e.g. Okta) are known not to set "typ" on their ID Tokens.
+//   - RFC 9068 access token JWTs carry "at+jwt"; media types are
+//     case-insensitive (RFC 2045), so any casing is accepted and the
+//     signature is treated as an OIDC signature.
+//   - Every other value is treated as case-sensitive, matching the JWS/JWT
+//     "typ" semantics, and returned as-is (e.g. "JWT", "dpop+id_token",
+//     "CIC", "COS"). An unrecognized value is rejected later by the caller.
+func classifySignatureType(typ string) SignatureType {
+	if typ == "" {
+		// Missing typ claim, assume this is from the OIDC provider.
+		return OIDC
+	}
+	if strings.EqualFold(typ, "at+jwt") {
+		// RFC 9068 access token JWTs carry the same identity claims as OIDC
+		// ID tokens; treat them as OIDC tokens for OpenPubKey.
+		return OIDC
+	}
+	return SignatureType(typ)
+}
+
+// checkSignatureCounts enforces the PK Token signature uniqueness matrix.
+// A PK Token must contain exactly one OIDC (or key bound OIDC) signature,
+// exactly one CIC signature and at most one COS signature. Rejecting
+// duplicate segments here ensures a signature can never silently overwrite
+// another signature of the same type.
+func checkSignatureCounts(opCount, cicCount, cosCount int) error {
+	if opCount == 0 {
+		return fmt.Errorf(`at least one signature of type "oidc" or "oidc_gq" is required`)
+	} else if opCount > 1 {
+		return fmt.Errorf(`only one signature of type "oidc" or "oidc_gq" is allowed, found %d`, opCount)
+	}
+
+	if cicCount == 0 {
+		return fmt.Errorf(`at least one signature of type "cic" is required`)
+	} else if cicCount > 1 {
+		return fmt.Errorf(`only one signature of type "cic" is allowed, found %d`, cicCount)
+	}
+
+	if cosCount > 1 {
+		return fmt.Errorf(`only one signature of type "cos" is allowed, found %d`, cosCount)
+	}
+	return nil
+}
+
 type PKToken struct {
 	raw []byte // the original, raw representation of the object
 
@@ -88,35 +139,61 @@ func NewFromCompact(pktCom []byte) (*PKToken, error) {
 	if err != nil {
 		return nil, err
 	}
-	pkt := &PKToken{}
 
+	// Parse and classify every token before mutating any PK Token state so
+	// that a malformed or duplicated segment can never leave the caller with
+	// a half-populated PK Token. The signature type, payload ownership and
+	// re-encoding rules are intentionally identical to UnmarshalJSON.
+	type parsedSig struct {
+		token   []byte
+		sigType SignatureType
+	}
+	parsedTokens := make([]parsedSig, 0, len(tokens))
+	opCount, cicCount, cosCount := 0, 0, 0
 	for _, token := range tokens {
-		parsedToken, err := oidc.NewJwt(token)
+		jwt, err := oidc.NewJwt(token)
 		if err != nil {
 			return nil, err
 		}
-		typ := parsedToken.GetSignature().GetProtectedClaims().Type
-		if typ == "" {
-			// missing typ claim, assuming this is from the OIDC provider and set typ=OIDC=JWT
-			// Okta is known not to set the typ parameter on their ID Tokens
-			// The JWT RFC-7519 encourages but does not require that typ be set saying about typ
-			//  "This parameter is ignored by JWT implementations; any processing of this parameter is
-			// performed by the JWT application.  If present, it is RECOMMENDED that its value be "JWT"
-			//  to indicate that this object is a JWT."
-			//  https://datatracker.ietf.org/doc/html/rfc7519#section-5.1
-			typ = string(OIDC)
-		} else if strings.EqualFold(typ, "at+jwt") {
-			// RFC 9068 access token JWTs carry the same identity claims as OIDC ID tokens.
-			// Ticino issues access tokens as at+JWT; treat them as OIDC tokens for OpenPubKey.
-			// Media types are case-insensitive (RFC 2045), so match any casing.
-			typ = string(OIDC)
-		}
 
-		sigType := SignatureType(typ)
-		if err := pkt.AddSignature(token, sigType); err != nil {
+		// Use the same signature type matrix as the JSON entry point. This
+		// keeps missing "typ", "at+jwt" (RFC 9068) and key bound ID Tokens
+		// consistent regardless of how the PK Token was serialized.
+		sigType := classifySignatureType(jwt.GetSignature().GetProtectedClaims().Type)
+
+		// Track the uniqueness of each signature type up front so that
+		// duplicate CIC/OIDC/COS segments are rejected instead of silently
+		// overwriting a previously parsed signature.
+		switch sigType {
+		case OIDC, OIDCKB:
+			opCount++
+		case CIC:
+			cicCount++
+		case COS:
+			cosCount++
+		default:
+			return nil, fmt.Errorf("unrecognized signature type: %s", sigType)
+		}
+		parsedTokens = append(parsedTokens, parsedSig{token: token, sigType: sigType})
+	}
+	if err := checkSignatureCounts(opCount, cicCount, cosCount); err != nil {
+		return nil, err
+	}
+
+	// Every segment has been fully validated; only now do we construct the
+	// PK Token. AddSignature additionally enforces that every token shares the
+	// same payload (payload ownership) and that CIC/COS "typ" claims match.
+	pkt := &PKToken{}
+
+	for _, parsed := range parsedTokens {
+		if err := pkt.AddSignature(parsed.token, parsed.sigType); err != nil {
 			return nil, err
 		}
 	}
+
+	// The refreshed ID Token carries its own, different payload and is only
+	// appended to the compact representation, so it is tracked separately and
+	// must never be folded into the shared PK Token payload.
 	pkt.FreshIDToken = freshIDToken
 	return pkt, nil
 }
@@ -342,7 +419,11 @@ func (p *PKToken) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
-	p.Payload = parsed.Payload() // base64 decoded
+	// Build into a local PK Token so that any failure (malformed headers,
+	// unrecognized signature type or duplicate segments) never leaves the
+	// target PK Token in a half-populated state.
+	tmp := &PKToken{}
+	tmp.Payload = parsed.Payload() // base64 decoded
 
 	opCount := 0
 	cicCount := 0
@@ -360,56 +441,39 @@ func (p *PKToken) UnmarshalJSON(data []byte) error {
 		}
 
 		protected := signature.ProtectedHeaders()
-		var sigType SignatureType
 		var typeHeader string
-
-		if err := protected.Get(jws.TypeKey, &typeHeader); err == nil {
-			sigType = SignatureType(typeHeader)
-			if strings.EqualFold(typeHeader, "at+jwt") {
-				// RFC 9068 access token JWTs; treat as OIDC tokens for OpenPubKey.
-				// Media types are case-insensitive (RFC 2045), so match any casing.
-				sigType = OIDC
-			}
-		} else {
-			// missing typ claim, assuming this is from the OIDC provider
-			sigType = OIDC
-		}
+		// A missing "typ" claim leaves typeHeader empty and is handled by
+		// the shared classifier (it defaults to an OIDC signature).
+		_ = protected.Get(jws.TypeKey, &typeHeader)
+		// Classify with the same matrix used by NewFromCompact so that the
+		// JSON and compact entry points cannot diverge.
+		sigType := classifySignatureType(typeHeader)
 
 		switch sigType {
 		case OIDC, OIDCKB:
 			opCount += 1
-			p.Op = signature
-			p.OpToken = []byte(rawJws.Signatures[i].Protected + "." + rawJws.Payload + "." + rawJws.Signatures[i].Signature)
+			tmp.Op = signature
+			tmp.OpToken = []byte(rawJws.Signatures[i].Protected + "." + rawJws.Payload + "." + rawJws.Signatures[i].Signature)
 		case CIC:
 			cicCount += 1
-			p.Cic = signature
-			p.CicToken = []byte(rawJws.Signatures[i].Protected + "." + rawJws.Payload + "." + rawJws.Signatures[i].Signature)
+			tmp.Cic = signature
+			tmp.CicToken = []byte(rawJws.Signatures[i].Protected + "." + rawJws.Payload + "." + rawJws.Signatures[i].Signature)
 		case COS:
 			cosCount += 1
-			p.Cos = signature
-			p.CosToken = []byte(rawJws.Signatures[i].Protected + "." + rawJws.Payload + "." + rawJws.Signatures[i].Signature)
+			tmp.Cos = signature
+			tmp.CosToken = []byte(rawJws.Signatures[i].Protected + "." + rawJws.Payload + "." + rawJws.Signatures[i].Signature)
 		default:
 			return fmt.Errorf("unrecognized signature type: %s", sigType)
 		}
 	}
 
 	// Do some signature count verifications
-	if opCount == 0 {
-		return fmt.Errorf(`at least one signature of type "oidc" or "oidc_gq" is required`)
-	} else if opCount > 1 {
-		return fmt.Errorf(`only one signature of type "oidc" or "oidc_gq" is allowed, found %d`, opCount)
+	if err := checkSignatureCounts(opCount, cicCount, cosCount); err != nil {
+		return err
 	}
 
-	if cicCount == 0 {
-		return fmt.Errorf(`at least one signature of type "cic" is required`)
-	} else if cicCount > 1 {
-		return fmt.Errorf(`only one signature of type "cic" is allowed, found %d`, cicCount)
-	}
-
-	if cosCount > 1 {
-		return fmt.Errorf(`only one signature of type "cos" is allowed, found %d`, cosCount)
-	}
-
+	// All segments validated; commit the fully built state atomically.
+	*p = *tmp
 	return nil
 }
 
